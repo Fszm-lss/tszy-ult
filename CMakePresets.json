@@ -1,0 +1,128 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "$env{CMAKE_CXX_FLAGS} -Wno-error=deprecated-declarations",
+        "CMAKE_CXX_STANDARD": "17"
+      },
+      "toolchainFile": "$env{HOME}/code/vcpkg/scripts/buildsystems/vcpkg.cmake",
+      "generator": "Unix Makefiles",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "base-mingw",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "$env{CMAKE_CXX_FLAGS} -Wno-error=deprecated-declarations",
+        "CMAKE_CXX_STANDARD": "17"
+      },
+      "generator": "MinGW Makefiles",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug (Development)",
+      "description": "Full debug build: symbols enabled, no optimization, assertions active.",
+      "inherits": ["base"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (Production)",
+      "description": "Optimized release build: NDEBUG defined, debug info stripped.",
+      "inherits": ["base"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "RelWithDebInfo (CI & Testing)",
+      "description": "Optimized + debug symbols: fast execution with full stack traces.",
+      "inherits": ["base"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "debug-mingw",
+      "displayName": "Debug (MSYS2)",
+      "description": "Debug build for MSYS2 UCRT64 (x64-mingw-static).",
+      "inherits": ["base-mingw"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release-mingw",
+      "displayName": "Release (MSYS2)",
+      "description": "Release build for MSYS2 UCRT64 (x64-mingw-static).",
+      "inherits": ["base-mingw"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "relwithdebinfo-mingw",
+      "displayName": "RelWithDebInfo (MSYS2)",
+      "description": "RelWithDebInfo build for MSYS2 UCRT64 (x64-mingw-static).",
+      "inherits": ["base-mingw"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "displayName": "Build Debug",
+      "description": "Build the Debug configuration."
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "displayName": "Build Release",
+      "description": "Build the Release configuration."
+    },
+    {
+      "name": "relwithdebinfo",
+      "configurePreset": "relwithdebinfo",
+      "displayName": "Build RelWithDebInfo",
+      "description": "Build the RelWithDebInfo configuration."
+    },
+    {
+      "name": "debug-mingw",
+      "configurePreset": "debug-mingw",
+      "displayName": "Build Debug (MSYS2)",
+      "description": "Build the MSYS2 Debug configuration."
+    },
+    {
+      "name": "release-mingw",
+      "configurePreset": "release-mingw",
+      "displayName": "Build Release (MSYS2)",
+      "description": "Build the MSYS2 Release configuration."
+    },
+    {
+      "name": "relwithdebinfo-mingw",
+      "configurePreset": "relwithdebinfo-mingw",
+      "displayName": "Build RelWithDebInfo (MSYS2)",
+      "description": "Build the MSYS2 RelWithDebInfo configuration."
+    }
+  ]
+}

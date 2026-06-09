@@ -1,0 +1,9 @@
+{
+    "logic":   [{ "name": "logic",   "origin": 101, "host": "localhost", "port": 35101 },
+                { "name": "logic",   "origin": 101, "host": "127.0.0.1", "port": 35101 }],
+    "common":  [{ "name": "common",  "origin": 102, "host": "localhost", "port": 35102 }],
+    "dbproxy": [{ "name": "dbproxy", "origin": 103, "host": "localhost", "port": 35103 },
+                { "name": "dbproxy", "origin": 103, "host": "127.0.0.1", "port": 35103 }],
+    "dbagent": [{ "name": "dbagent", "origin": 104, "host": "localhost", "port": 35104 }],
+    "gate":    [{ "name": "gate",    "origin": 105, "host": "localhost", "port": 35105 }]
+}

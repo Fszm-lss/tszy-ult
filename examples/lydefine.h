@@ -1,0 +1,5 @@
+#pragma once
+
+#define LYGATE_CLIENT_ORGIN     0x10
+#define LYCOMMON_CLIENT_ORGIN   0x20
+#define LYDBAGENT_CLIENT_ORGIN  0x30

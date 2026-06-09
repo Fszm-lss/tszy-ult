@@ -1,0 +1,25 @@
+# Build
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test keys
+test/key/
+
+# AI instruction files (not for distribution)
+CODEBUDDY.md
+AGENTS.md
+
+# Temporary / misc
+*.deb
+*.tar.gz
+/tmp/
