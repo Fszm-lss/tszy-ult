@@ -4,6 +4,7 @@
 #include "lygc/handshake_helper_v2.hpp"
 #include "lydefine.h"
 #include "nlohmann/json.hpp"
+#include <openssl/obj_mac.h>
 
 using json = nlohmann::json;
 using namespace zbf;
@@ -39,7 +40,7 @@ public:
     bool handshake(const std::string& keyPath) {
         if (!_clientSide.loadRSAKey(keyPath, true)) return false;
 
-        HandshakeReq* hsReq = _clientSide.creatHSReq(512);
+        HandshakeReq* hsReq = _clientSide.creatHSReq(KX_ECDH, NID_X9_62_prime256v1);
         if (!hsReq) return false;
 
         _clientSide.logHSReq(hsReq);
@@ -64,7 +65,8 @@ public:
             return false;
         }
         LOG_MSG(LogLevel::Info, "post handshake request success");
-        _tmp_sym_sec = hsReq->tmp_sym_sec;
+        _temp_symsec = hsReq->temp_symsec;
+        _temp_symsec_type = (openssl_utils::eEncryptType)hsReq->temp_symsec_type;
         delete hsReq;
         return true;
     }
@@ -76,7 +78,7 @@ public:
             return;
         }
 
-        HandshakeResp* hsResp = _clientSide.decryptHSResp(binHSResp, _tmp_sym_sec);
+        HandshakeResp* hsResp = _clientSide.decryptHSResp(binHSResp, _temp_symsec, _temp_symsec_type);
         if (!hsResp) {
             LOG_ERR_MSG("handshake fail, decrypt response error");
             _hsFail = true;
@@ -84,9 +86,10 @@ public:
         }
 
         _clientSide.logHSResp(hsResp);
-        std::string shareKey = _clientSide.makeShareKey(hsResp->dh_pubkey);
+        std::string shareKey = _clientSide.makeShareKey(hsResp->getPeerPubkey());
         _secret  = shareKey.substr(0, 16);
         _ivec    = shareKey.substr(16, 16);
+        _enctype = (openssl_utils::eEncryptType)hsResp->session_symsec_type;
         _hsSuccess = true;
         delete hsResp;
         LOG_MSG(LogLevel::Info, "handshake success");
@@ -120,7 +123,8 @@ private:
     handshake_helper _clientSide;
     bool _hsSuccess;
     bool _hsFail;
-    std::string _tmp_sym_sec;
+    std::string _temp_symsec;
+    openssl_utils::eEncryptType _temp_symsec_type;
     std::string _secret;
     std::string _ivec;
     openssl_utils::eEncryptType _enctype;
@@ -169,8 +173,7 @@ void onExit() {
 int main(int argc, char** argv)
 {
     std::atexit(onExit);
-    std::string log_path = log_utils::getModulePath();
-    log_path += ".log";
+    std::string log_path = log_utils::createLogPath();
     log_utils::open(log_path.c_str(), LogLevel::Trace);
 
     lymsg_protocol* proto = new lymsg_protocol;

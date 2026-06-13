@@ -200,6 +200,11 @@ void test_ecc(int curve_nid)
 	openssl_utils::ecc_destroy(&key2);
 }
 
+// Key exchange process
+// 1. Client encrypts exchange info and temporary symmetric key using RSA public key, sends to server; server decrypts using RSA private key
+// 2. Server encrypts exchange info using temporary key, sends to client; client decrypts using temporary symmetric key
+// 3. Client / server each generate a session symmetric key from the paired exchange info
+// 4. Client and server communicate using the session symmetric key
 void test_dh(int bits)
 {
 	printf("DH bits: %d\n", bits);

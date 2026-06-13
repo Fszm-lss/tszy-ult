@@ -51,21 +51,30 @@ public:
         char szText[2048];
         memset(szText, 0, sizeof(szText));
 
-        std::string title = levelDesc(level);
-        snprintf(szText, sizeof(szText), "%s ", title.c_str());
-        size_t len = title.length() + 1;
+        const char* title = levelDesc(level);
+        size_t len = strlen(title);
+        memcpy(szText, title, len);
+        szText[len++] = ' ';
         
+        // Cache time string per second to avoid localtime/strftime on every log line
         struct timespec ts;
         if (!clock_gettime(CLOCK_REALTIME, &ts)) {
-            struct tm* timeinfo = localtime(&ts.tv_sec);
-            size_t l = strftime(szText+len, sizeof(szText)-len, "%Y/%m/%d %H:%M:%S", timeinfo);
-            len += l;
-            snprintf(szText+len, sizeof(szText)-len, ".%03ld ", ts.tv_nsec/1000000);
-            len += 5;
+            if (ts.tv_sec != _lastTimeSec) {
+                struct tm timeinfo;
+#ifdef _WIN32
+                localtime_s(&timeinfo, &ts.tv_sec);
+#else
+                localtime_r(&ts.tv_sec, &timeinfo);
+#endif
+                _cachedTimeLen = strftime(_cachedTimeStr, sizeof(_cachedTimeStr), "%Y/%m/%d %H:%M:%S", &timeinfo);
+                _lastTimeSec = ts.tv_sec;
+            }
+            memcpy(szText + len, _cachedTimeStr, _cachedTimeLen);
+            len += _cachedTimeLen;
+            len += snprintf(szText+len, sizeof(szText)-len, ".%03ld ", ts.tv_nsec/1000000);
         }
 
-        snprintf(szText+len, sizeof(szText)-len, "%07d ", getPrintId());
-        len += 8;
+        len += snprintf(szText+len, sizeof(szText)-len, "%07d ", getPrintId());
 
 		va_list args;
 		va_start(args, fmt);
@@ -76,45 +85,25 @@ public:
             fprintf(_file, "%s\n", szText);
             fflush(_file);
         }
-        // printf("%s\n", szText);
+#ifndef NDEBUG
         fprintf(stdout, "%s\n", szText);
         fflush(stdout);
+#endif
     }
 
-    static std::string levelDesc(unsigned int level) {
-        std::string desc;
+    static const char* levelDesc(unsigned int level) {
         switch (level)
         {
-        case Debug:
-            desc = "[Debug]";
-            break;
-        case Error:
-            desc = "[Error]";
-            break;
-        case Info:
-            desc = "[ Info]";
-            break;
-        case Warn:
-            desc = "[ Warn]";
-            break;
-        case Trace:
-            desc = "[Trace]";
-            break;
-        case TraceMore:
-            desc = "[ More]";
-            break;
-        case Check:
-            desc = "[Check]";
-            break;
-        case Fatal:
-            desc = "[Fatal]";
-            break;
-
-        default:
-            desc = "[Trace]";
-            break;
+        case Debug:     return "[Debug]";
+        case Error:     return "[Error]";
+        case Info:      return "[ Info]";
+        case Warn:      return "[ Warn]";
+        case Trace:     return "[Trace]";
+        case TraceMore: return "[ More]";
+        case Check:     return "[Check]";
+        case Fatal:     return "[Fatal]";
+        default:        return "[Trace]";
         }
-        return desc;
     }
 
     static int getThreadId() {
@@ -130,6 +119,14 @@ public:
         return getShortId();
 #else
         return getThreadId();
+#endif
+    }
+
+    static int getProcessId() {
+#ifdef _WIN32
+        return (int)GetCurrentProcessId();
+#else
+        return getpid();
 #endif
     }
 
@@ -154,7 +151,7 @@ public:
         if (!_file) return -2;
 
         log_level = level;
-        LOG_MSG(LogLevel::Info, "logger open, path=%s, level=%s", path, levelDesc(level).c_str());
+        LOG_MSG(LogLevel::Info, "logger open, path=%s, level=%s", path, levelDesc(level));
         return 0;
     }
 
@@ -187,16 +184,11 @@ public:
 #endif
     }
 
-    static std::string createLogPath(bool shortMode = true) {
-        char szBuf[64] = {0};
-        time_t now;
-        std::time(&now);
-        struct tm* timeinfo = localtime(&now);
-        if (shortMode)
-            strftime(szBuf, sizeof(szBuf), "%Y%m%d", timeinfo);
-        else
-            strftime(szBuf, sizeof(szBuf), "%Y%m%d_%H%M%S", timeinfo);
-        return getModulePath() + std::string("_") + std::string(szBuf) + std::string(".log");
+    static std::string createLogPath(bool appendPid = true) {
+        if (appendPid) {
+            return getModulePath() + std::string("-") + std::to_string(getProcessId()) + std::string(".log");
+        }
+        return getModulePath() + std::string(".log");
     }
 
 public:
@@ -206,6 +198,9 @@ private:
     inline static  FILE*        _file{nullptr};
     inline static  std::mutex   _lockLOG;
     inline static  std::unordered_map<int, short> _thd2id;
+    inline static  time_t       _lastTimeSec{0};
+    inline static  char         _cachedTimeStr[32] = {};
+    inline static  size_t       _cachedTimeLen{0};
 };
 
 }

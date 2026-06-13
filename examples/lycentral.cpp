@@ -19,7 +19,7 @@ int main(int argc, char** argv)
 {
     signal_utils::ignoreSignal(SIGPIPE);
     signal_utils::handleSignal(onSignal, {SIGINT, SIGTERM});
-    std::string log_path = log_utils::getModulePath() + ".log";
+    std::string log_path = log_utils::createLogPath();
     log_utils::open(log_path.c_str(), LogLevel::Trace);
     
     std::string data;
@@ -33,5 +33,6 @@ int main(int argc, char** argv)
     cs.registerApi();
     cs.start();
 
+    LOG_MSG(LogLevel::Debug, "CentralServer exit");
     return 0;
 }

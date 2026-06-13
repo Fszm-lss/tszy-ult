@@ -14,15 +14,20 @@ public:
     virtual tcp_message* createResponse(const lymsg_header* reqHeader, const std::string& respData) override;
 
 private:
-    void finHandshake(bool success, const std::string& shareKey = std::string()) {
-        if (success && shareKey.length() >= 32) {
+    void setHandshakeSuccess(const std::string& shareKey, openssl_utils::eEncryptType sessionType) {
+        if (shareKey.length() >= 32) {
             _secret  = shareKey.substr(0, 16);
             _ivec    = shareKey.substr(16, 16);
-            _enctype = openssl_utils::eEncryptType::eET_AES_CFB;
+            _enctype = sessionType;
             _handshakeFin.store(true);
         } else {
             _handshakeFin.store(false);
+            LOG_ERR_MSG("setHandshakeSuccess error, shareKey invalid, len=%d", shareKey.length());
         }
+    }
+
+    void setHandshakeFail() {
+        _handshakeFin.store(false);
     }
 
     std::string decrypt(const std::string& data) {
@@ -66,6 +71,9 @@ public:
         return _serverSide.loadRSAKey(keyPath, false);
     }
 
+    void setSessionSecType(openssl_utils::eEncryptType t) { _session_symsec_type = t; }
+    openssl_utils::eEncryptType getSessionSecType() const { return _session_symsec_type; }
+
     std::string onHandshake(const std::string& reqData, std::string& shareKey) {
         std::lock_guard<std::mutex> lock(_lockHandshake);
         HandshakeReq* hsReq = _serverSide.decryptHSReq(reqData);
@@ -74,15 +82,15 @@ public:
         }
         _serverSide.logHSReq(hsReq);
 
-        HandshakeResp* hsResp = _serverSide.creatHSResp(hsReq);
+        HandshakeResp* hsResp = _serverSide.creatHSResp(hsReq, _session_symsec_type);
         if (!hsResp) {
             delete hsReq;
             return std::string();
-        }        
+        }
         _serverSide.logHSResp(hsResp);
 
-        shareKey = _serverSide.makeShareKey(hsReq->dh_pubkey);
-        std::string respData = _serverSide.encryptHSResp(hsResp, hsReq->tmp_sym_sec);
+        shareKey = _serverSide.makeShareKey(hsReq->getPeerPubkey());
+        std::string respData = _serverSide.encryptHSResp(hsResp, hsReq->temp_symsec, (openssl_utils::eEncryptType)hsReq->temp_symsec_type);
         delete hsReq;
         delete hsResp;
         return respData;
@@ -91,6 +99,7 @@ public:
 private:
     handshake_helper _serverSide;
     std::mutex _lockHandshake;
+    openssl_utils::eEncryptType _session_symsec_type{openssl_utils::eEncryptType::eET_AES_CFB};
 };
 
 void GateUser::onRequest(const lymsg_header* reqHeader, const std::string& reqData) {
@@ -99,12 +108,12 @@ void GateUser::onRequest(const lymsg_header* reqHeader, const std::string& reqDa
         std::string shareKey;
         std::string respData = gateServer->onHandshake(reqData, shareKey);
         if (respData.empty()) { // handshake fail
-            finHandshake(false);
+            setHandshakeFail();
             LOG_ERR_MSG("handshake fail, reply empty string");
             tcp_message* ack = NetUser::createResponse(reqHeader, std::string());
             this->post(ack);
         } else {
-            finHandshake(true, shareKey);
+            setHandshakeSuccess(shareKey, gateServer->getSessionSecType());
             LOG_MSG(LogLevel::Debug, "handshake success, response size=%d", respData.size());
             tcp_message* resp = NetUser::createResponse(reqHeader, respData);
             this->post(resp);

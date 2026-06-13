@@ -55,6 +55,7 @@ int main(int argc, char** argv)
     lygc::GateServer server(gateConf, zbf::LogLevel::Trace);
     g_gateServer = &server;
     server.loadPrivateKey("key/rsa_private_key.pem");
+    server.setSessionSecType(fszm::openssl_utils::eEncryptType::eET_AES_CFB);
 
     // handle gate client
     server.registerUserHandler(LYGATE_CLIENT_ORGIN, new GateUserHandler);

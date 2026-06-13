@@ -51,7 +51,7 @@ void worker(void* param) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     g_asyncMgr->stop();
 }
 
@@ -62,9 +62,8 @@ void onExit() {
 int main(int argc, char** argv)
 {
     std::atexit(onExit);
-    std::string log_path = log_utils::getModulePath();
-    log_path += ".log";
-    log_utils::open(log_path.c_str(), LogLevel::Debug);
+    std::string log_path = log_utils::createLogPath();
+    log_utils::open(log_path.c_str(), LogLevel::Trace);
 
     lymsg_protocol* proto = new lymsg_protocol;
     async_client_manager cltMgr(proto);

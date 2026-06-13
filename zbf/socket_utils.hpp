@@ -53,7 +53,9 @@ inline socket_init _socket_init_;
 
 #define EXIT_RC(rc, code)  { rc = code; goto exit; }
 #define INVALID_SOCK       (-1)
-
+// IS_ERR_AGAIN cross-platform error check:
+// Linux: errno, checks EAGAIN/EINTR
+// Windows: getSockErr() returns WSAGetLastError() instead of errno, checks WSAEWOULDBLOCK, EINTR not present
 #ifdef _WIN32
 #define IS_ERR_AGAIN(err)  ((err) == WSAEWOULDBLOCK)
 inline int getSockErr() { return WSAGetLastError(); }
@@ -329,6 +331,7 @@ public:
         return recv_with_retry_(fd, buf, buf_size, max_retry);
 	}
 
+    // Blocking read of size bytes until full, peer close, or error
     // return -2 peer close | -1 error | >= 0 success
     static int recv_all(int fd, void* buf, int size) {
         unsigned char* p = static_cast<unsigned char*>(buf);
@@ -343,7 +346,7 @@ public:
         while (left > 0) {
             int n = ::recv(fd, RECV_BUF(p), left, 0);
             if (n == 0) {
-                // peer close
+                // Peer closed
                 return -2;
             }
             if (n < 0) {
@@ -354,6 +357,7 @@ public:
                         return size-left;
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    // Interrupted or temporarily unreadable, retry
                     continue;
                 }
                 LOG_SOCK_ERR(err, "recv_all fail, fd=%d, expect=%d, left=%d", fd, size, left);
@@ -431,6 +435,21 @@ public:
         return 0;
     }
 
+    static int setReusePort(int fd) {
+#ifdef _WIN32
+        return 0;
+#else
+        int reuse = 1;
+        socklen_t len = sizeof(reuse);
+        if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, SOCK_OPT_CVAL(reuse), len) < 0) {
+            LOG_LAST_ERR("setsockopt(SO_REUSEPORT) fail, fd=%d", fd);
+            return -1;
+        }
+        LOG_MSG(LogLevel::Trace, "%s success, fd=%d, val=%d", __FUNCTION__, fd, reuse);
+        return 0;
+#endif
+    }
+
     // allow IPv6 socket to accept v4 connections (dual-stack)
     // on Linux it's the default; on Windows IPV6_V6ONLY=1 by default, must opt in
     static int setDualstack(int fd, int family) {
@@ -506,6 +525,10 @@ public:
         }
 
         if (socket_utils::setReuseAddr(fd)) {
+            EXIT_RC(rc, -3);
+        }
+
+        if (socket_utils::setReusePort(fd)) {
             EXIT_RC(rc, -3);
         }
 

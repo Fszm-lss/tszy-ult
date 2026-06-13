@@ -1,5 +1,6 @@
 #ifndef socket_tcp_hpp
 #define socket_tcp_hpp
+// 2025-10, "::" support both v4 and v6, "0.0.0.0" for ipv4
 
 #include <cstdio>
 #include <string>
@@ -126,7 +127,6 @@ private:
 
     int onRecv(memchunk* chunk) {
         if (isClosed()) return 1;
-        std::lock_guard<std::mutex> lock(_lockRC);
         int rc = _recvCache->push(chunk->buffer, chunk->datasize);
         if (rc < 0) {
             LOG_ERR_MSG("onRecv(%s), push buffer fail, rc=%d", desc(false).c_str(), rc);
@@ -141,7 +141,6 @@ private:
 
     tcp_message* getRecvMsg() {
         if (isClosed()) return nullptr;
-        std::lock_guard<std::mutex> lock(_lockRC);
         tcp_message* msg = zbf::_PopMsg(_recvCache, _protocol);
         if (msg) {
             _hbhelper.update();
@@ -202,7 +201,6 @@ private:
     std::string _peerAddr;
     unsigned short _peerPort{0};
     memchunk* _recvCache{nullptr};
-    std::mutex _lockRC;
     std::list<TcpMsgPtr> _wrQueue;
     std::mutex _lockWRQ;
     std::unordered_set<tcp_message*> _rdColl;
@@ -231,7 +229,7 @@ struct WorkerIdGroup {
 
 class tcpsock_server {
 public:
-    enum { MaxPendingMsg = 256 };
+    enum { MaxPendingMsg = 512 };
     typedef std::unique_ptr<SafeQueue<TcpMsgPtr, MaxPendingMsg> > SafeQueuePtr;
 public:
     // protocol: caller construct buf owner(this class) destruct
@@ -287,6 +285,10 @@ public:
         }
 
         if (socket_utils::setReuseAddr(fd)) {
+            EXIT_RC(rc, -3);
+        }
+
+        if (socket_utils::setReusePort(fd)) {
             EXIT_RC(rc, -3);
         }
 
@@ -496,8 +498,12 @@ private:
             std::lock_guard<std::mutex> lock(_lockF2U);
             _fd2user[fd] = user;
         }
-        std::lock_guard<std::mutex> lock(_lockUS);
-        _users.push_back(user);
+        {
+            std::lock_guard<std::mutex> lock(_lockUS);
+            _users.push_back(user);
+        }
+        user->setStart();
+        user->onConnect();
         return user;
     }
 
@@ -607,6 +613,11 @@ private:
                             if (user) {
                                 if (user->onRecv(&chunk)) {
                                     onIOError(fd, "cache data error");
+                                } else {
+                                    tcp_message* msg = nullptr;
+                                    while ((msg = user->getRecvMsg()) != nullptr) {
+                                        dispatchMsg(msg, user);
+                                    }
                                 }
                             }
                         } else if (recvLen == -2) {
@@ -646,15 +657,13 @@ private:
         const int update_time_interval = 1000/ThreadIdle; // almost 1s
 
         for (;;) {
-            if (isShutDown()) {
-				break;
-			}
+            if (isShutDown()) break;
+            
             if (++counter >= update_time_interval) {
                 now = socket_utils::currentTimeSecs();
                 counter = 0;
             }
 
-            bool idle = true;
             user = popFrontUser();
             if (user != nullptr) {
                 // check if user expired
@@ -667,30 +676,17 @@ private:
                     user->onDisconnect();
                     std::lock_guard<std::mutex> lock(_lockCU);
                     _closedUsers.push_back(user);
-                    idle = false;
                 } else {
-                    if (!user->isStarted()) {
-                        user->setStart();
-                        user->onConnect();
-                        idle = false;
-                    }
                     // check if user need write
                     if (!user->isQueueEmpty()) {
                         user->enableWrite(_efd, true);
                     }
-                    // get message and dispatch to worker
-                    tcp_message* msg = user->getRecvMsg();
-                    if (msg != nullptr) {
-                        dispatchMsg(msg, user);
-                        idle = false;
-                    }
                     pushUserBack(user);
                 }
-            }
-            if (idle)
-                std::this_thread::sleep_for(std::chrono::milliseconds(ThreadIdle));
-            else
                 std::this_thread::yield();
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(ThreadIdle));
+            }
         }
         LOG_MSG(LogLevel::Debug, "%s monitor thread(%d) exit", desc().c_str(), thdId);
         return 0;
@@ -723,6 +719,9 @@ private:
                         uint32_t msgType = _protocol->type(msg);
                         reqStat.onReqStart(msgType);
                         user_sp->onRecvMsg(msg);
+                        if (!user_sp->isQueueEmpty()) {
+                            user_sp->enableWrite(_efd, true);
+                        }
                         reqStat.onReqFinish(msgType);
                     }
                 }
@@ -854,8 +853,13 @@ public:
 
         socket_utils::set_nonblocking(fd);
         conn = ::connect(fd, svr_addr->ai_addr, svr_addr->ai_addrlen);
+        // Standard non-blocking connect flow:
+        // 1) connect once
+        // 2) if EINPROGRESS/EINTR, wait for writable
+        // 3) check SO_ERROR to determine final connection result
         if (conn == 0) {
             rc = 0;
+            // Connected immediately
         } else {
             if (socket_utils::checkConnError(conn, logErr)) {
                 if (logErr) LOG_ERR_MSG("connect fail(%s)", addrAndPort.c_str());
@@ -1132,6 +1136,7 @@ private:
         {
             std::lock_guard<std::mutex> lock(_lockClients);
             if (_clients.size() < _poolSize && _idleList.empty()) {
+                // Placeholder only, connect after releasing lock
                 newClt = new tcpsock_client(_serverAddr.c_str(), _serverPort, _protocol, clientSeq(), _poolName.c_str());
                 _clients.push_back(newClt);
             }
@@ -1367,7 +1372,7 @@ private:
     bool _enableWrite;
     std::mutex _lockEW;
     
-    enum { BufferSize = 1024, MaxPendingSize = 10485760, MaxPendingMsg = 128 };
+    enum { BufferSize = 1024, MaxPendingSize = 10485760, MaxPendingMsg = 256 };
 };
 
 enum { POST_SUCCESS = 0, POST_FAIL = 1 };
@@ -1658,9 +1663,8 @@ private:
         LOG_MSG(LogLevel::Debug, "%s monitor thread(%d) start", desc().c_str(), thdId);
 
         for (;;) {
-            if (isShutDown()) {
-				break;
-			}
+            if (isShutDown()) break;
+
             std::vector<tcpsock_ha_asynclt*> haCltsCopy;
             {
                 std::lock_guard<std::mutex> lock(_lockHAClients);
@@ -1703,9 +1707,8 @@ private:
         const int check_alive_interval = 3000/ThreadIdle; // almost 3s
 
         for (;;) {
-            if (isShutDown()) {
-				break;
-			}
+            if (isShutDown()) break;
+
             bool check_alive = false;
             if (++counter >= check_alive_interval) {
                 check_alive = true;
@@ -1726,9 +1729,8 @@ private:
 
             // handle all clients in groups
             for (tcpsock_ha_asynclt* ha_clt : haCltsPart) {
-                if (isShutDown()) {
-                    break;
-                }
+                if (isShutDown()) break;
+                
                 std::vector<tcpsock_asynclt*> clients = ha_clt->allClients();
                 for (tcpsock_asynclt* asynclt : clients) {
                     if (!isMonitored(asynclt))
