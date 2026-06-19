@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <thread>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <atomic>
 #include <algorithm>
@@ -44,7 +45,7 @@ struct TcpMsgPtr {
 
 enum { SEND_SUCCESS = 0, SEND_FAIL = 1, SOCK_CLOSED = 2, QUEUE_EMPTY = 3, RECV_FAIL = 4, SEND_TIMEOUT = 5, POOL_INVALID = 6 };
 inline int _SendMsg(int fd, const tcp_message* msg);
-inline int _SendData(int fd, std::list<TcpMsgPtr>& queue, std::mutex& lockQueue);
+inline int _SendData(int fd, std::list<std::unique_ptr<tcp_message>>& queue, std::mutex& lockQueue);
 inline tcp_message* _PopMsg(memchunk* recvCache, tcp_message_protocol* protocol);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -94,14 +95,13 @@ public:
         return _started;
     }
 
-    // if fail, caller need delete msg
-    int post(tcp_message* msg) {
+    int post(std::unique_ptr<tcp_message> msg) {
         std::lock_guard<std::mutex> lock(_lockWRQ);
         if (_wrQueue.size() > MaxPendingMsg) {
-            LOG_ERR_MSG("send fail, queue full(%d)", _wrQueue.size());
+            LOG_ERR_MSG("send fail, queue full(%d), msg=%s", _wrQueue.size(), msg->desc().c_str());
             return 1;
         }
-        _wrQueue.emplace_back(TcpMsgPtr(msg));
+        _wrQueue.push_back(std::move(msg));
         return 0;
     }
     
@@ -201,7 +201,7 @@ private:
     std::string _peerAddr;
     unsigned short _peerPort{0};
     memchunk* _recvCache{nullptr};
-    std::list<TcpMsgPtr> _wrQueue;
+    std::list<std::unique_ptr<tcp_message>> _wrQueue;
     std::mutex _lockWRQ;
     std::unordered_set<tcp_message*> _rdColl;
     std::mutex _lockRDC;
@@ -228,21 +228,19 @@ struct WorkerIdGroup {
 };
 
 class tcpsock_server {
-public:
+private:
     enum { MaxPendingMsg = 512 };
     typedef std::unique_ptr<SafeQueue<TcpMsgPtr, MaxPendingMsg> > SafeQueuePtr;
 public:
     // protocol: caller construct buf owner(this class) destruct
     tcpsock_server(tcp_message_protocol* protocol) : _statLogger(StatInterval, zbf::Minute) {
-        _protocol = protocol;
+        _protocol.reset(protocol);
         _efd = INVALID_SOCK;
         _shutdown = false;
         _maxConnections = DefaultMaxConns;
     }
 
-    virtual ~tcpsock_server() {
-        if (_protocol) delete _protocol;
-    }
+    virtual ~tcpsock_server() = default;
 
     int open(std::vector<HOST_AND_PORT >& addr_and_ports) {
         int cnt = 0;
@@ -493,7 +491,7 @@ private:
         }
 
         user->init(addr.c_str(), port, fd, _userSeq.fetch_add(1, std::memory_order_relaxed));
-        user->setProtocol(_protocol);
+        user->setProtocol(_protocol.get());
         {
             std::lock_guard<std::mutex> lock(_lockF2U);
             _fd2user[fd] = user;
@@ -782,7 +780,7 @@ protected:
     enum { StatInterval = 5, ThreadIdle = 20, EpollWait = 50, BufferSize = 4096, BackLog = 128, ThdIdBase = 200, DefaultMsgType = 0, DefaultMaxConns = 6000 };
 
 private:
-    tcp_message_protocol* _protocol{nullptr}; // holder
+    std::unique_ptr<tcp_message_protocol> _protocol; // holder
     int _efd;
     std::unordered_set<int> _listenFds;
     std::atomic<unsigned long long> _userSeq{1ULL};
@@ -830,6 +828,7 @@ public:
         disconnect();
     }
 
+    // RET: 0=success, non-zero=fail
     int connect(int timeout = 2000, bool logErr = true) {
         _closed = false;
         disconnect(); // reset _fd
@@ -897,7 +896,14 @@ exit:
     }
 
     int send(const tcp_message* req, tcp_message** ack = nullptr) {
-        return innerSend(req, ack);
+        int rc = innerSend(req, ack);
+        if (rc == zbf::SEND_FAIL) {
+            disconnect();
+            if (connect(1000, false) == 0) {
+                rc = innerSend(req, ack);
+            }
+        }
+        return rc;
     }
 
     std::string desc(bool brief = true) {
@@ -937,6 +943,8 @@ exit:
 private:
     // SEND_SUCCESS / SEND_FAIL / RECV_FAIL
     int innerSend(const tcp_message* req, tcp_message** ack) {
+        if (!isConnected()) return SEND_FAIL;
+        
         int rc = 0;
         int recvlen = 0;
         tcp_message* res = nullptr;
@@ -1018,18 +1026,15 @@ class tcpsock_cltpool : object_tracker<tcpsock_cltpool> {
 public:
     // protocol: caller construct buf owner(this class) destruct
     tcpsock_cltpool(tcp_message_protocol* protocol, const char* name = "cltpool") {
-        _protocol = protocol;
+        _protocol.reset(protocol);
         _poolName = name;
         _poolSize = 0;
         _serverPort = 0;
-        _heartbeat = _protocol->genHeartbeat();
+        _heartbeat.reset(_protocol->genHeartbeat());
     }
 
     // must call close() before destructor
-    virtual ~tcpsock_cltpool() {
-        delete _protocol;
-        delete _heartbeat;
-    }
+    virtual ~tcpsock_cltpool() = default;
 
     int open(const char* serverAddr, unsigned short serverPort, int poolSize = 8) {
         if (!serverAddr || serverPort == 0 || poolSize == 0) {
@@ -1063,19 +1068,12 @@ public:
     // SEND_SUCCESS / SEND_FAIL / SEND_TIMEOUT / SOCK_CLOSED
     int send(const tcp_message* req, tcp_message** ack, int wait_max = 2000 /*ms*/) {
         int rc = zbf::SEND_TIMEOUT;
-        int wait = 50;
-        int total_wait = 0;
-
-        do {
-            tcpsock_client* clt = popIdleClient();
-            if (clt != nullptr) {
-                rc = poolSend(clt, req, ack);
-                pushClientBack(clt);
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(wait));
-            total_wait += wait;
-        } while (total_wait < wait_max);
+        tcpsock_client* clt = popIdleClient(wait_max);
+        if (clt != nullptr) {
+            rc = clt->send(req, ack);
+            updatePoolState(rc);
+            pushClientBack(clt);
+        }
 
         if (rc) {
             LOG_MSG(LogLevel::Warn, "pool(%s) send fail, req=%s, rc=%d", desc().c_str(), req->desc().c_str(), rc);
@@ -1095,7 +1093,6 @@ public:
 
     void keepAlive() {
         std::list<tcpsock_client*> hbList;
-
         {
             std::lock_guard<std::mutex> lock(_lockClients);
             int size = _idleList.size();
@@ -1111,7 +1108,7 @@ public:
         }
         
         for (tcpsock_client* clt : hbList) {
-            poolSend(clt, _heartbeat, nullptr);
+            clt->send(_heartbeat.get(), nullptr);
         }
 
         std::lock_guard<std::mutex> lock(_lockClients);
@@ -1124,20 +1121,20 @@ public:
 
 private:
     tcpsock_client* createClient() {
-        tcpsock_client* clt = new tcpsock_client(_serverAddr.c_str(), _serverPort, _protocol, clientSeq(), _poolName.c_str());
+        tcpsock_client* clt = new tcpsock_client(_serverAddr.c_str(), _serverPort, _protocol.get(), clientSeq(), _poolName.c_str());
         int rc = clt->connect();
-        LOG_MSG(LogLevel::Debug, "createClient(%s), connect=%d", clt->desc().c_str(), rc);
         updatePoolState(rc);
+        LOG_MSG(LogLevel::Debug, "createClient(%s), connect=%d", clt->desc().c_str(), rc);
         return clt;
     }
 
-    tcpsock_client* popIdleClient() {
+    tcpsock_client* popIdleClient(int wait_ms = 0) {
         tcpsock_client* newClt = nullptr;
         {
             std::lock_guard<std::mutex> lock(_lockClients);
             if (_clients.size() < _poolSize && _idleList.empty()) {
                 // Placeholder only, connect after releasing lock
-                newClt = new tcpsock_client(_serverAddr.c_str(), _serverPort, _protocol, clientSeq(), _poolName.c_str());
+                newClt = new tcpsock_client(_serverAddr.c_str(), _serverPort, _protocol.get(), clientSeq(), _poolName.c_str());
                 _clients.push_back(newClt);
             }
         }
@@ -1151,37 +1148,30 @@ private:
             } else {
                 _clients.erase(std::find(_clients.begin(), _clients.end(), newClt));
                 delete newClt;
-                newClt = nullptr;
             }
         }
 
-        tcpsock_client* clt = nullptr;
-        std::lock_guard<std::mutex> lock(_lockClients);
+        std::unique_lock<std::mutex> lock(_lockClients);
         if (!_idleList.empty()) {
-            clt = _idleList.front();
+            tcpsock_client* clt = _idleList.front();
             _idleList.pop_front();
+            return clt;
         }
-        return clt;
+        if (wait_ms > 0) {
+            _cvIdle.wait_for(lock, std::chrono::milliseconds(wait_ms), [this]{ return !_idleList.empty(); });
+            if (!_idleList.empty()) {
+                tcpsock_client* clt = _idleList.front();
+                _idleList.pop_front();
+                return clt;
+            }
+        }
+        return nullptr;
     }
 
     void pushClientBack(tcpsock_client* clt) {
         std::lock_guard<std::mutex> lock(_lockClients);
         _idleList.push_back(clt);
-    }
-
-    int poolSend(tcpsock_client* clt, const tcp_message* req, tcp_message** ack) {
-        int rc = zbf::SOCK_CLOSED;
-        if (clt->isConnected()) { // fd maybe broken, since it's client status
-            rc = clt->send(req, ack);
-        }
-        if (rc) {
-            clt->connect(1000, false); // maybe fail, while server is down
-            if (clt->isConnected()) {
-                rc = clt->send(req, ack);
-            }
-        }
-        updatePoolState(rc);
-        return rc;
+        _cvIdle.notify_one();
     }
 
     void updatePoolState(int rc) {
@@ -1193,10 +1183,10 @@ private:
     }
 
 private:
-    tcp_message_protocol* _protocol; // holder
+    std::unique_ptr<tcp_message_protocol> _protocol; // holder
     std::string _poolName;
     int _poolSize;
-    tcp_message* _heartbeat;
+    std::unique_ptr<tcp_message> _heartbeat;
 
     std::string _serverAddr;
     unsigned short _serverPort;
@@ -1205,6 +1195,7 @@ private:
     std::list<tcpsock_client*> _idleList;
     std::vector<tcpsock_client*> _clients;
     std::mutex _lockClients;
+    std::condition_variable _cvIdle;
     std::atomic<bool> _poolInvalid{false};
 };
 
@@ -1253,12 +1244,18 @@ public:
 
     // call every tcpsock_client::HeartbeatTime to keep connection alive
     void keepAlive() {
-        for (tcpsock_cltpool* pool : _cltPools) {
+        std::vector<tcpsock_cltpool*> poolsCopy;
+        {
+            std::lock_guard<std::mutex> lock(_lockCltPool);
+            poolsCopy = _cltPools;
+        }
+        for (tcpsock_cltpool* pool : poolsCopy) {
             pool->keepAlive();
         }
     }
 
     void status() {
+        std::lock_guard<std::mutex> lock(_lockCltPool);
         for (tcpsock_cltpool* pool : _cltPools) {
             pool->status();
         }
@@ -1303,14 +1300,13 @@ public:
         _wrQueue.clear();
     }
 
-    // if fail, caller need delete msg
-    int post(tcp_message* msg) {
+    int post(std::unique_ptr<tcp_message> msg) {
         std::lock_guard<std::mutex> lock(_lockWRQ);
         if (_wrQueue.size() > MaxPendingMsg) {
-            LOG_ERR_MSG("send fail, queue full(%d)", _wrQueue.size());
+            LOG_ERR_MSG("send fail, queue full(%d), msg=%s", _wrQueue.size(), msg->desc().c_str());
             return 1;
         }
-        _wrQueue.emplace_back(TcpMsgPtr(msg));
+        _wrQueue.push_back(std::move(msg));
         return 0;
     }
 
@@ -1367,7 +1363,7 @@ public:
 private:
     memchunk* _recvCache;
     std::mutex _lockRC;
-    std::list<TcpMsgPtr> _wrQueue;
+    std::list<std::unique_ptr<tcp_message>> _wrQueue;
     std::mutex _lockWRQ;
     bool _enableWrite;
     std::mutex _lockEW;
@@ -1412,13 +1408,11 @@ public:
     }
 
 public:
-    // POST_SUCCESS / POST_FAIL
-    // if fail, caller need delete msg
-    int post(tcp_message* msg) {
+    int post(std::unique_ptr<tcp_message> msg) {
         int rc = zbf::POST_FAIL;
         tcpsock_asynclt* asynclt = getClient();
         if (asynclt) {
-            if (0 == asynclt->post(msg))
+            if (0 == asynclt->post(std::move(msg)))
                 rc = zbf::POST_SUCCESS;
         }
         return rc;
@@ -1454,15 +1448,13 @@ class async_client_manager {
 public:
     // protocol: caller construct buf owner(this class) destruct
     async_client_manager(tcp_message_protocol* protocol) {
-        _protocol = protocol;
+        _protocol.reset(protocol);
         _shutdown = false;
         _workerNum = 0;
         _efd = INVALID_SOCK;
     }
 
-    virtual ~async_client_manager() {
-        delete _protocol;
-    }
+    virtual ~async_client_manager() = default;
 
     void start(int workerNum = 4) {
         _efd = socket_poll::sp_create();
@@ -1532,7 +1524,7 @@ public:
         LOG_MSG(LogLevel::Debug, "%s: current clients=%d/%d", desc().c_str(), _fd2client.size(), total);
     }
 
-    tcp_message_protocol* getProtocol() { return _protocol; }
+    tcp_message_protocol* getProtocol() { return _protocol.get(); }
 
 private:
     void clearClients() {
@@ -1618,6 +1610,7 @@ private:
                 LOG_LAST_ERR("sp_wait fail, efd=%d", _efd);
                 break;
             }
+            bool hasRecv = false;
             for (int i = 0; i < n; ++i) {
                 if (isShutDown()) break;
                 
@@ -1631,6 +1624,7 @@ private:
                             if (asynclt->onRecv(&chunk)) {
                                 onIOError(fd, asynclt, "cache data");
                             }
+                            hasRecv = true;
                         } else {
                             LOG_MSG(LogLevel::Warn, "unidentified read, no monitored client(%p), recvLen=%d, fd=%d", asynclt, recvLen, fd);
                         }
@@ -1653,6 +1647,9 @@ private:
                     onIOError(fd, asynclt, "error or eof");
                 }
             }
+            if (hasRecv) {
+                _cvWorker.notify_all();
+            }
         }
         LOG_MSG(LogLevel::Debug, "%s ioprocessor thread(%d) exit", desc().c_str(), thdId);
         return 0;
@@ -1661,9 +1658,17 @@ private:
     int monitor(short thdId) {
         log_utils::registerThreadId(thdId);
         LOG_MSG(LogLevel::Debug, "%s monitor thread(%d) start", desc().c_str(), thdId);
+        int check_alive_counter = 0;
+        const int check_alive_interval = 3000/ThreadIdle; // almost 3s
 
         for (;;) {
             if (isShutDown()) break;
+
+            bool do_check_alive = false;
+            if (++check_alive_counter >= check_alive_interval) {
+                check_alive_counter = 0;
+                do_check_alive = true;
+            }
 
             std::vector<tcpsock_ha_asynclt*> haCltsCopy;
             {
@@ -1679,12 +1684,16 @@ private:
                             addMonitored(asynclt);
                             LOG_MSG(LogLevel::Debug, "start monitor (%s)", asynclt->desc().c_str());
                         } else {
-                            if (!asynclt->connect(1000, false)) { // not connected or closed
+                            // connect: 0=success -> !0=true -> enter addMonitored
+                            if (!asynclt->connect(1000, false)) {
                                 addMonitored(asynclt);
                                 LOG_MSG(LogLevel::Debug, "start monitor (%s)", asynclt->desc().c_str());
                             }
                         }
                     } else {
+                        if (do_check_alive) {
+                            checkAlive(asynclt);
+                        }
                         if (!asynclt->isQueueEmpty()) {
                             asynclt->enableWrite(_efd, true);
                         }
@@ -1703,17 +1712,9 @@ private:
         log_utils::registerThreadId(thdId);
         LOG_MSG(LogLevel::Debug, "%s worker thread(%d) start, index=%d", desc().c_str(), thdId, workerIndex);
         int workerNum = _workerNum;
-        int counter = 0;
-        const int check_alive_interval = 3000/ThreadIdle; // almost 3s
 
         for (;;) {
             if (isShutDown()) break;
-
-            bool check_alive = false;
-            if (++counter >= check_alive_interval) {
-                check_alive = true;
-                counter = 0;
-            }
 
             bool idle = true;
             // pickup matched part
@@ -1737,14 +1738,12 @@ private:
                         continue;
                     if (notifyRecv(asynclt, ha_clt))
                         idle = false;
-                    if (check_alive && checkAlive(asynclt)) {
-                        idle = false;
-                    }
                 }
             }
             if (idle) {
                 // this thread is idle
-                std::this_thread::sleep_for(std::chrono::milliseconds(ThreadIdle));
+                std::unique_lock<std::mutex> lock(_lockWorker);
+                _cvWorker.wait_for(lock, std::chrono::milliseconds(ThreadIdle));
             } else {
                 std::this_thread::yield();
             }
@@ -1766,10 +1765,7 @@ private:
     bool checkAlive(tcpsock_asynclt* asynclt) {
         if (asynclt->isConnected() && !asynclt->isClosed()) {
             if (asynclt->needHeartbeat()) {
-                tcp_message* hb = _protocol->genHeartbeat();
-                if (0 != asynclt->post(hb)) {
-                    delete hb;
-                }
+                asynclt->post(std::unique_ptr<tcp_message>(_protocol->genHeartbeat()));
                 return true;
             }
         }
@@ -1782,7 +1778,7 @@ private:
 
 private:
     int _efd;
-    tcp_message_protocol* _protocol{nullptr}; // holder
+    std::unique_ptr<tcp_message_protocol> _protocol; // holder
     bool _shutdown;
     std::mutex _lockSD;
     std::thread _iothread;
@@ -1795,6 +1791,8 @@ private:
     std::unordered_set<tcpsock_asynclt*> _monitorColl;    // ref, do not manage memory
     std::unordered_map<int, tcpsock_asynclt*> _fd2client; // ref
     std::mutex _lockMonitorColl;
+    std::mutex _lockWorker;
+    std::condition_variable _cvWorker;
     
     enum { BufferSize = 4096, ThdIdBase = 300, ThreadIdle = 20, EpollWait = 50 };
 };
@@ -1819,35 +1817,30 @@ inline int _SendMsg(int fd, const tcp_message* msg) {
 }
 
 // SEND_SUCCESS / SEND_FAIL / QUEUE_EMPTY
-inline int _SendData(int fd, std::list<TcpMsgPtr>& queue, std::mutex& lockQueue) {
-    tcp_message* msg = nullptr;
+inline int _SendData(int fd, std::list<std::unique_ptr<tcp_message>>& queue, std::mutex& lockQueue) {
+    std::unique_ptr<tcp_message> msg;
     {
         std::lock_guard<std::mutex> lock(lockQueue);
         if (queue.empty()) return zbf::QUEUE_EMPTY;
-        msg = queue.front().release();
+        msg = std::move(queue.front());
         queue.pop_front();
     }
 
     int rc = zbf::SEND_SUCCESS;
-    int sendlen = zbf::_SendMsg(fd, msg);
+    int sendlen = zbf::_SendMsg(fd, msg.get());
     if (sendlen <= 0) {
         if (sendlen != -2) {
-            delete msg;
             rc = zbf::SEND_FAIL;
         } else {
             std::lock_guard<std::mutex> lock(lockQueue);
-            queue.emplace_front(TcpMsgPtr(msg));
+            queue.emplace_front(std::move(msg));
         }
     } else if (sendlen < (int) msg->data.size()) {
-        tcp_message* rest = new tcp_message();
+        auto rest = std::make_unique<tcp_message>();
         rest->data.assign(msg->data.data() + sendlen, msg->data.size() - sendlen);
         std::lock_guard<std::mutex> lock(lockQueue);
-        queue.emplace_front(TcpMsgPtr(rest));
-        delete msg;
+        queue.emplace_front(std::move(rest));
         // as success
-    } else {
-        delete msg;
-        // success
     }
     return rc;
 }

@@ -1,5 +1,6 @@
 #ifndef net_server_hpp
 #define net_server_hpp
+// 2025-9
 
 #include <atomic>
 #include <list>
@@ -63,15 +64,14 @@ public:
         respHeader.origin = _baseOrigin;
         respHeader.type = reqHeader->type | LYMSG_TYPE_RESP;
         respHeader.serial = reqHeader->serial;
-        respHeader.param = 0;
         return lymsg_helper::packMsg(&respHeader, respData);
     }
 
-    void postMsg(tcp_message* msg) {
-        int rc = tcpsock_user::post(msg);
+    void postMsg(std::unique_ptr<tcp_message> msg) {
+        if (!msg) return;
+        int rc = tcpsock_user::post(std::move(msg));
         if (rc) {
-            LOG_ERR_MSG("post msg fail: msg=%s, user=%s, rc=%d", msg->desc().c_str(), desc().c_str(), rc);
-            delete msg;
+            LOG_ERR_MSG("post msg fail, user=%s, rc=%d", desc().c_str(), rc);
         }
     }
 
@@ -98,15 +98,13 @@ public:
     int request(lymsg_header* reqHeader, const std::string& reqData, Handler handler = nullptr) {
         if (!reqHeader) return -1;
         reqHeader->origin = _localOrigin;
-        zbf::tcp_message* msg = lymsg_helper::packMsg(reqHeader, reqData);
-        int rc = tcpsock_ha_asynclt::post(msg);
+        auto msg = std::unique_ptr<zbf::tcp_message>(lymsg_helper::packMsg(reqHeader, reqData));
+        int rc = tcpsock_ha_asynclt::post(std::move(msg));
         if (zbf::POST_SUCCESS == rc) {
             if (handler) {
                 std::lock_guard<std::mutex> lock(_lockHandlers);
                 _msgHandlers.insert(std::make_pair(reqHeader->serial, handler));
             }
-        } else {
-            delete msg;
         }
         return rc;
     }
@@ -275,7 +273,7 @@ public:
             tcp_message* resp = user->createResponse(ctx->reqHeader, respData);
             LOG_MSG(LogLevel::Trace, "%s success, id=%lu, req=%s, respSz=%lu", __FUNCTION__, reqId, 
                 LYMSG_DESC(ctx->reqHeader).c_str(), respData.size());
-            user->postMsg(resp);
+            user->postMsg(std::unique_ptr<tcp_message>(resp));
 
             _user2ReqIds[user].remove(reqId);
             _reqContext.erase(it);
@@ -344,11 +342,9 @@ void NetUser::onRequest(const lymsg_header* reqHeader, const std::string& reqDat
         std::string respData;
         request_id_t reqId = _handler->onRequest(reqHeader, reqData, respData);
         if (reqId == RespType::SYNC_RESPONSE) {
-            tcp_message* resp = createResponse(reqHeader, respData);
-            postMsg(resp);
+            postMsg(std::unique_ptr<tcp_message>(createResponse(reqHeader, respData)));
         } else if (reqId == RespType::NO_RESPONSE) {
-            tcp_message* ack = createResponse(reqHeader, std::string());
-            postMsg(ack);
+            postMsg(std::unique_ptr<tcp_message>(createResponse(reqHeader, std::string())));
         } else {
             // save request context
             _baseServer->saveReqContext(reqId, this, reqHeader, reqData);

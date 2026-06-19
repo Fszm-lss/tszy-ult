@@ -23,10 +23,8 @@ public:
             // g_server->stop();
         } else {
             std::string str = strText + std::string("_reply");
-            tcp_message* reply = proto ? proto->genMessage(0x10, str) : nullptr;
-            if (reply && post(reply)) {
-                delete reply;
-            }
+            auto reply = std::unique_ptr<tcp_message>(proto ? proto->genMessage(0x10, str) : nullptr);
+            if (reply) post(std::move(reply));
         }
     }
     virtual void onDisconnect() {

@@ -34,17 +34,15 @@ void worker(void* param) {
         header.origin = LYCOMMON_CLIENT_ORGIN;
         header.type = 0x20;
         header.serial = i;
-        header.param = 0;
 
         json jobj;
         jobj["msg"] = randstr;
         std::string jsonstr = jobj.dump();
         header.size = jsonstr.size();
-        tcp_message* msg = lymsg_helper::packMsg(&header, jsonstr);
-        int rc = client->post(msg);
+        auto msg = std::unique_ptr<tcp_message>(lymsg_helper::packMsg(&header, jsonstr));
+        int rc = client->post(std::move(msg));
         if (rc) {
             LOG_ERR_MSG("post fail: msg=%s, rc=%d", LYMSG_DESC(&header).c_str(), rc);
-            delete msg;
         } else {
             LOG_MSG(LogLevel::Info, "post success: msg=%s, rc=%d", LYMSG_DESC(&header).c_str(), rc);
         }

@@ -54,13 +54,11 @@ public:
         header.origin = LYGATE_CLIENT_ORGIN;
         header.type = LYMSG_TYPE_HANDSHAKE;
         header.serial = 0;
-        header.param = 0x8000;
 
-        tcp_message* msg = lymsg_helper::packMsg(&header, binHSReq);
-        int rc = post(msg);
+        auto msg = std::unique_ptr<tcp_message>(lymsg_helper::packMsg(&header, binHSReq));
+        int rc = post(std::move(msg));
         if (rc) {
             LOG_ERR_MSG("post handshake request fail, rc=%d", rc);
-            delete msg;
             delete hsReq;
             return false;
         }
@@ -132,14 +130,14 @@ private:
 
 void worker(void* param) {
     common_client* client = (common_client*) param;
-    lymsg_header header;
+    lymsg_header header = {0};
     int length = fszm::random_utils::randomNumber(16, 32);
     std::string randstr = fszm::random_utils::randomString(fszm::NumbersAndLetters, length);
     for (int i = 1; i <= 10; ++i) {
         header.origin = LYGATE_CLIENT_ORGIN;
-        header.type = 0x20;
+        header.type = 0x20;        
+        header.type |= LYMSG_TYPE_ENC;
         header.serial = i;
-        header.param = LYMSG_PARAM_ENC;
 
         json jobj;
         jobj["msg"] = randstr;
@@ -147,16 +145,15 @@ void worker(void* param) {
         std::string result;
         bool success = client->encrypt(jsonstr, result);
         if (!success) {
-            header.param = 0x0;
+            header.type &= ~LYMSG_TYPE_ENC;
             result = jsonstr;
         }
 
         header.size = result.size();
-        tcp_message* msg = lymsg_helper::packMsg(&header, result);
-        int rc = client->post(msg);
+        auto msg = std::unique_ptr<tcp_message>(lymsg_helper::packMsg(&header, result));
+        int rc = client->post(std::move(msg));
         if (rc) {
             LOG_ERR_MSG("post fail: msg=%s, rc=%d", LYMSG_DESC(&header).c_str(), rc);
-            delete msg;
         } else {
             LOG_MSG(LogLevel::Info, "post success: msg=%s, rc=%d", LYMSG_DESC(&header).c_str(), rc);
         }

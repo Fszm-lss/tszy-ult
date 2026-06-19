@@ -48,7 +48,7 @@ private:
         return result;
     }
 
-    bool isHandshake() {
+    bool isHandshakeDone() {
         return _handshakeFin.load();
     }
 
@@ -110,18 +110,16 @@ void GateUser::onRequest(const lymsg_header* reqHeader, const std::string& reqDa
         if (respData.empty()) { // handshake fail
             setHandshakeFail();
             LOG_ERR_MSG("handshake fail, reply empty string");
-            tcp_message* ack = NetUser::createResponse(reqHeader, std::string());
-            this->post(ack);
+            this->post(std::unique_ptr<tcp_message>(NetUser::createResponse(reqHeader, std::string())));
         } else {
             setHandshakeSuccess(shareKey, gateServer->getSessionSecType());
             LOG_MSG(LogLevel::Debug, "handshake success, response size=%d", respData.size());
-            tcp_message* resp = NetUser::createResponse(reqHeader, respData);
-            this->post(resp);
+            this->post(std::unique_ptr<tcp_message>(NetUser::createResponse(reqHeader, respData)));
         }
     } else {
         std::string plainReqData;
-        if (reqHeader->param & LYMSG_PARAM_ENC) { // encrypt msg
-            if (isHandshake()) {
+        if (reqHeader->type & LYMSG_TYPE_ENC) { // encrypt msg
+            if (isHandshakeDone()) {
                 LOG_MSG(LogLevel::TraceMore, "decrypt request, size=%d", reqData.size());
                 plainReqData = decrypt(reqData);
             } else {
@@ -138,8 +136,8 @@ void GateUser::onRequest(const lymsg_header* reqHeader, const std::string& reqDa
 
 tcp_message* GateUser::createResponse(const lymsg_header* reqHeader, const std::string& respData) {
     std::string packData;
-    if (reqHeader->param & LYMSG_PARAM_ENC) {
-        if (isHandshake()) {
+    if (reqHeader->type & LYMSG_TYPE_ENC) {
+        if (isHandshakeDone()) {
             LOG_MSG(LogLevel::TraceMore, "encrypt response, size=%d", respData.size());
             packData = encrypt(respData);
         } else {

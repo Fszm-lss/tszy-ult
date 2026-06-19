@@ -1,9 +1,14 @@
 #ifndef lymsg_protocol_hpp
 #define lymsg_protocol_hpp
+// 2025-9
 
 #include <cinttypes>
 #include <cstdio>
-
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <arpa/inet.h>
+#endif
 #include "zbf/tcp_message.hpp"
 #include "zbf/socket_tcp_v5.hpp"
 
@@ -12,25 +17,21 @@
 // When undefined (default), fields use host byte order, suitable for homogeneous x86_64 deployments.
 // #define LYMSG_NETWORK_BYTE_ORDER
 
-#ifdef LYMSG_NETWORK_BYTE_ORDER
-#include <arpa/inet.h>
-#endif
-
 namespace lygc {
 using zbf::tcp_message_protocol;
 using zbf::tcp_message;
 
 #pragma pack(1)
 struct lymsg_header {
-    uint16_t origin;  // 2
+    uint16_t origin;  // 2    
+    uint16_t reserve; // 2
     uint32_t type;    // 4
     uint64_t serial;  // 8
-    uint32_t size;    // 4, body size
-    uint16_t param;   // 2
-}; // total 20 bytes
+    uint32_t size;    // 4, body size    
+};
 #pragma pack()
 
-// #define LYMSG_NETWORK_BYTE_ORDER
+
 #ifdef LYMSG_NETWORK_BYTE_ORDER
 
 // 64-bit network/host byte order conversion (no standard htonll/ntohll in POSIX)
@@ -46,17 +47,17 @@ inline uint64_t ntohll(uint64_t net) {
 }
 inline void hton(lymsg_header& header) {
     header.origin = htons(header.origin);
+    header.reserve = htons(header.reserve);
     header.type   = htonl(header.type);
     header.serial = htonll(header.serial);
-    header.size   = htonl(header.size);
-    header.param  = htons(header.param);
+    header.size   = htonl(header.size);    
 }
 inline void ntoh(lymsg_header& header) {
     header.origin = ntohs(header.origin);
+    header.reserve = ntohs(header.reserve);
     header.type   = ntohl(header.type);
     header.serial = ntohll(header.serial);
-    header.size   = ntohl(header.size);
-    header.param  = ntohs(header.param);
+    header.size   = ntohl(header.size);    
 }
 
 #else
@@ -68,14 +69,13 @@ inline void ntoh(lymsg_header&) {}
 
 #endif // LYMSG_NETWORK_BYTE_ORDER
 
-#define LYMSG_TYPE_REQ           0x00000000 // request flag
+#define LYMSG_TYPE_REQ           0x00000000 // request  flag
 #define LYMSG_TYPE_RESP          0x80000000 // response flag
+#define LYMSG_TYPE_ENC           0x40000000 // encrypt  flag
 #define LYMSG_TYPE_HANDSHAKE     0x00000011 // handshake msg
 #define LYMSG_TYPE_DB_MYSQL      0x00000021 
 #define LYMSG_TYPE_DB_MONGO      0x00000022
 #define LYMSG_TYPE_RESERVE       0x000000FF
-
-#define LYMSG_PARAM_ENC          0x8000 // encrypt flag
 
 #define LYMSG_DESC(pHeader)  lygc::lymsg_helper::lymsg_desc(pHeader)
 
@@ -163,15 +163,15 @@ public:
 
     static std::string lymsg_desc(const lymsg_header* header) {
         char szDesc[64] = { 0 };
-        const char* fmt = "[%u|0x%x|%" PRIu64 "|%u|0x%x]";
-        snprintf(szDesc, sizeof(szDesc), fmt, header->origin, header->type, header->serial, header->size, header->param);
+        const char* fmt = "[%u|0x%x|0x%x|%" PRIu64 "|%u]";
+        snprintf(szDesc, sizeof(szDesc), fmt, header->origin, header->reserve, header->type, header->serial, header->size);
         return std::string(szDesc);
     }
 };
 
-inline std::string strBrief(const std::string& src, int len = 64) {
-    if (src.length() <= len) return src;
-    return src.substr(0, len) + "..." + std::to_string(src.size());
+inline std::string strBrief(const std::string& src, int maxVisiable = 50) {
+    if (src.length() <= maxVisiable) return src;
+    return src.substr(0, maxVisiable) + "..." + std::to_string(src.size());
 }
 
 

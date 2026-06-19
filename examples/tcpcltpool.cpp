@@ -41,11 +41,11 @@ int main(int argc, char** argv)
     default_msg_proto* proto = new default_msg_proto;
     g_proto = proto;
     tcpsock_cltpool pool(proto);
-    pool.open("127.0.0.1", 4701, 1);
+    pool.open("127.0.0.1", 4701, 2);
     LOG_MSG(LogLevel::Info, "connect to server success, pool=(%s)", pool.desc().c_str());
     g_pool = &pool;
 
-    int count = 1;
+    int count = 2;
     std::vector<std::thread*> thds;
     for (int i = 0; i < count; ++i) {
         std::thread* thd = new std::thread([&, i](){
