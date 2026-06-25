@@ -68,7 +68,7 @@ int main(int argc, char** argv)
     g_asyncMgr = &cltMgr;    
     common_client* client = new common_client();
     client->addConnect("127.0.0.1", 35102, proto);
-    client->addConnect("127.0.0.1", 35112, proto);
+    client->addConnect("127.0.0.1", 35112, proto); // would fail
     client->addConnect("::1", 35102, proto);
     cltMgr.manageClient(client);
     cltMgr.start(1);

@@ -20,9 +20,9 @@ using asio::ip::tcp;
 class tcpsock_user;
 class tcpsock_listener {
 public:
-    virtual void on_connect(std::shared_ptr<tcpsock_user> user) = 0;
-    virtual void on_message(std::shared_ptr<tcpsock_user> user, std::unique_ptr<tcp_message> msg) = 0;
-    virtual void on_disconnect(std::shared_ptr<tcpsock_user> user) = 0;
+    virtual void onConnect(std::shared_ptr<tcpsock_user> user) = 0;
+    virtual void onRecvMsg(std::shared_ptr<tcpsock_user> user, std::unique_ptr<tcp_message> msg) = 0;
+    virtual void onDisconnect(std::shared_ptr<tcpsock_user> user) = 0;
 };
 
 
@@ -44,7 +44,7 @@ public:
     void start() {
         LOG_MSG(LogLevel::Debug, "(%s) start", desc().c_str());
         asio::post(_worker_strand, [self = shared_from_this()]() mutable {
-            self->_listener->on_connect(self);
+            self->_listener->onConnect(self);
             self->start_read();
         });
     }
@@ -206,7 +206,7 @@ private:
                     while (!chunk->empty()) {
                         auto msg = std::move(chunk->front());
                         chunk->pop_front();
-                        self->_listener->on_message(self, std::move(msg));
+                        self->_listener->onRecvMsg(self, std::move(msg));
                     }
                 });
             }
@@ -219,7 +219,7 @@ private:
 
         // if manually stop(), on_disconnect would not fire
         asio::post(_worker_strand, [self = shared_from_this()]() mutable {
-            self->_listener->on_disconnect(self);
+            self->_listener->onDisconnect(self);
         });
     }
 
@@ -304,8 +304,8 @@ protected:
     bool                      _pending{false};
     std::atomic<bool>         _stop;
     bool                      _server_side;
-    tcpsock_listener*         _listener;
     tcp_message_protocol*     _protocol;
+    tcpsock_listener*         _listener;
     std::string               _desc;
     std::mutex                _lockDesc;
 
@@ -318,10 +318,12 @@ protected:
 };
 
 using user_queue = std::unordered_set<std::shared_ptr<tcpsock_user>>;
-class tcpsock_server : public std::enable_shared_from_this<tcpsock_server>, public tcpsock_listener {
+class tcpsock_server : public std::enable_shared_from_this<tcpsock_server> {
 public:
-    tcpsock_server(const std::string& address, unsigned short port, tcp_message_protocol* protocol) : _ioProcessor("IO"),
-        _acceptor(_ioProcessor.get(0)), _timer(_ioProcessor.get(0)), _address(address), _port(port), _protocol(protocol) {
+    tcpsock_server(const std::string& address, unsigned short port, tcp_message_protocol* protocol, std::unique_ptr<tcpsock_listener> listener)
+        : _ioProcessor("IO"), _acceptor(_ioProcessor.get(0)), _timer(_ioProcessor.get(0)),
+          _address(address), _port(port), _listener(std::move(listener)), _adapter(this), _protocol(protocol) {
+        assert(_listener != nullptr);
     }
 
     virtual ~tcpsock_server() = default;
@@ -386,17 +388,12 @@ public:
         if (join) serveUtilStop();
     }
 
-public:
-    virtual void on_connect(std::shared_ptr<tcpsock_user> user) {
-    }
+    void setMaxConnections(int max) { _maxConnections.store(max, std::memory_order_relaxed); }
+    int getMaxConnections() const { return _maxConnections.load(std::memory_order_relaxed); }
 
-    virtual void on_message(std::shared_ptr<tcpsock_user> user, std::unique_ptr<tcp_message> msg) {
-    }
-
-    virtual void on_disconnect(std::shared_ptr<tcpsock_user> user) {
+    int currentConnections() {
         std::lock_guard<std::mutex> lock(_lockUQ);
-        LOG_MSG(LogLevel::Debug, "%s on_disconnect(%s)", desc().c_str(), user->desc().c_str());
-        _userQueue.erase(user);
+        return _userQueue.size();
     }
 
 private:
@@ -426,7 +423,7 @@ private:
 	}
 
     void do_accept() {
-        auto user = std::make_shared<tcpsock_user>(_ioProcessor.get_strand(0), _worker->get_strand(), true, _protocol.get(), (tcpsock_listener*)this);
+        auto user = std::make_shared<tcpsock_user>(_ioProcessor.get_strand(0), _worker->get_strand(), true, _protocol.get(), &_adapter);
         _acceptor.async_accept(user->sock(), [user, self = shared_from_this()](const std::error_code ec) {
             self->handle_accept(user, ec);
         });
@@ -446,11 +443,18 @@ private:
 
         // success
         LOG_MSG(LogLevel::Debug, "%s handle_accept success, user=(%s)", desc().c_str(), user->desc().c_str());
-        {
-            std::lock_guard<std::mutex> lock(_lockUQ);
-            _userQueue.insert(user);
+        int curConn = currentConnections();
+        int maxConn = getMaxConnections();
+        if (curConn >= maxConn) {
+            LOG_MSG(LogLevel::Warn, "%s connection limit reached: %d/%d, reject new connection", desc().c_str(), curConn, maxConn);
+            user->stop();
+        } else {
+            {
+                std::lock_guard<std::mutex> lock(_lockUQ);
+                _userQueue.insert(user);
+            }
+            user->start();
         }
-        user->start();
         do_accept();
     }
 
@@ -487,7 +491,26 @@ private:
     }
 
 private:
-    enum { ScanInterval = 5, LogEveryNScan = 12 };
+    class listener_adapter : public tcpsock_listener {
+    public:
+        explicit listener_adapter(tcpsock_server* server) : _server(server) {}
+        void onConnect(std::shared_ptr<tcpsock_user> user) override {
+            _server->_listener->onConnect(user);
+        }
+        void onRecvMsg(std::shared_ptr<tcpsock_user> user, std::unique_ptr<tcp_message> msg) override {
+            _server->_listener->onRecvMsg(user, std::move(msg));
+        }
+        void onDisconnect(std::shared_ptr<tcpsock_user> user) override {
+            _server->_listener->onDisconnect(user);
+            std::lock_guard<std::mutex> lock(_server->_lockUQ);
+            LOG_MSG(LogLevel::Debug, "%s on_disconnect(%s)", _server->desc().c_str(), user->desc().c_str());
+            _server->_userQueue.erase(user);
+        }
+    private:
+        tcpsock_server* _server;
+    };
+
+    enum { ScanInterval = 5, LogEveryNScan = 12, DefaultMaxConns = 6000 };
     asio_worker                         _ioProcessor;
     tcp::acceptor                       _acceptor;
     asio::steady_timer                  _timer;
@@ -496,7 +519,10 @@ private:
     std::unique_ptr<asio_worker>        _worker;
     user_queue                          _userQueue;
     std::mutex                          _lockUQ;
+    std::unique_ptr<tcpsock_listener>   _listener;
+    listener_adapter                    _adapter;
     int                                 _scanCount{0};
+    std::atomic<int>                    _maxConnections{DefaultMaxConns};
     std::unique_ptr<tcp_message_protocol> _protocol;
 };
 
@@ -628,8 +654,8 @@ private:
     std::shared_ptr<tcpsock_user>     _user;
     std::string                       _host;
     int                               _port;
-    asio::steady_timer                _hb_timer;
     std::unique_ptr<tcp_message_protocol> _protocol;
+    asio::steady_timer                _hb_timer;
 };
 
 }

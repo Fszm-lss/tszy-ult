@@ -15,6 +15,7 @@
 #include <atomic>
 #include <algorithm>
 #include <memory>
+#include <array>
 #include "memchunk.hpp"
 #include "socket_poll.hpp"
 #include "socket_utils.hpp"
@@ -144,24 +145,8 @@ private:
         tcp_message* msg = zbf::_PopMsg(_recvCache, _protocol);
         if (msg) {
             _hbhelper.update();
-            markMsgReceived(msg);
         }
         return msg;
-    }
-
-    void markMsgReceived(tcp_message* msg) {
-        std::lock_guard<std::mutex> lock(_lockRDC);
-        _rdColl.insert(msg);
-    }
-
-    void markMsgHandled(tcp_message* msg) {
-        std::lock_guard<std::mutex> lock(_lockRDC);
-        _rdColl.erase(msg);
-    }
-
-    bool checkAllMsgHandled() {
-        std::lock_guard<std::mutex> lock(_lockRDC);
-        return _rdColl.empty();
     }
 
     bool isExpired(TimeUnitSec now) {
@@ -203,8 +188,6 @@ private:
     memchunk* _recvCache{nullptr};
     std::list<std::unique_ptr<tcp_message>> _wrQueue;
     std::mutex _lockWRQ;
-    std::unordered_set<tcp_message*> _rdColl;
-    std::mutex _lockRDC;
     bool _closed{false};
     bool _started{false};
     std::mutex _lockState;
@@ -346,11 +329,6 @@ exit:
             LOG_MSG(LogLevel::Trace, "%s close, clear pending users, count=%d", desc().c_str(), _users.size());
             _users.clear();
         }
-        {
-            std::lock_guard<std::mutex> lock(_lockCU);
-            LOG_MSG(LogLevel::Trace, "%s close, clear closed users, count=%d", desc().c_str(), _closedUsers.size());
-            _closedUsers.clear();
-        }
         LOG_MSG(LogLevel::Debug, "%s close", desc().c_str());
     }
 
@@ -366,9 +344,9 @@ exit:
         workerNum = std::max(workerNum, 2);
         workerNum = std::min(workerNum, 64);
         for (int i = 1; i <= workerNum; ++i) {
-            short thdId = ThdIdBase+10+i; // max:ThdIdBase+10+64
+            short thdId = workerId(i); // max:ThdIdBase+10+64
             _workerIds.push_back(thdId);
-            _recvQueue[thdId] = std::make_unique<SafeQueue<TcpMsgPtr, MaxPendingMsg> >();
+            _recvQueues[i - 1] = std::make_unique<SafeQueue<TcpMsgPtr, MaxPendingMsg> >();
             std::thread* thd = new std::thread([&, thdId](){
                 worker(thdId);
             });
@@ -393,14 +371,14 @@ exit:
             delete thd;
         }
         _workers.clear();
-        for (auto& pair : _recvQueue) {
-            auto& queue = pair.second;
+        for (int i = 0; i < _workerIds.size(); ++i) {
+            auto& queue = _recvQueues[i];
             TcpMsgPtr ptr;
             while (queue->raw_pop(ptr)) {
                 // TcpMsgPtr destructor deletes msg
             }
+            _recvQueues[i].reset();
         }
-        _recvQueue.clear();
         LOG_MSG(LogLevel::Debug, "%s tcp threads stopped", desc().c_str());
 	}
 
@@ -409,9 +387,8 @@ exit:
             std::lock_guard<std::mutex> lock(_lockSD);
 		    _shutdown = true;
         }
-        for (auto& pair : _recvQueue) {
-            auto& queue = pair.second;
-            queue->stop();
+        for (int i = 0; i < _workerIds.size(); ++i) {
+            _recvQueues[i]->stop();
         }
         if (join) serveUtilStop();
 	}
@@ -541,21 +518,6 @@ private:
         return rc; 
     }
 
-    void clearClosedUsers(int max = 10) {
-        std::lock_guard<std::mutex> lock(_lockCU);
-        int m = _closedUsers.size();
-        if (m > max) m = max;
-        for (int i = 0; i < m; ++i) {
-            auto user = _closedUsers.front();
-            _closedUsers.pop_front();
-            if (user->checkAllMsgHandled()) {
-                LOG_MSG(LogLevel::Debug, "delete user(%s)", user->desc().c_str());
-            } else {
-                _closedUsers.push_back(user);
-            }
-        }
-    }
-
     int ioprocessor(short thdId) {
         log_utils::registerThreadId(thdId);
         LOG_MSG(LogLevel::Debug, "%s ioprocessor thread(%d) start", desc().c_str(), thdId);
@@ -565,8 +527,6 @@ private:
         
         for (;;) {
             if (isShutDown()) break;
-            clearClosedUsers();
-
             int n = socket_poll::sp_wait(_efd, ev, MAX_EVENT, EpollWait); // ms
             if (n < 0) {
                 LOG_LAST_ERR("sp_wait fail, efd=%d", _efd);
@@ -672,8 +632,6 @@ private:
                 // check if user closed
                 if (user->isClosed()) {
                     user->onDisconnect();
-                    std::lock_guard<std::mutex> lock(_lockCU);
-                    _closedUsers.push_back(user);
                 } else {
                     // check if user need write
                     if (!user->isQueueEmpty()) {
@@ -699,7 +657,7 @@ private:
         for (;;) {
             // get msg from worker queue
             TcpMsgPtr ptr;
-            int rc = _recvQueue[thdId]->pop_timeout(ptr, 100);
+            int rc = _recvQueues[workerIndex(thdId)]->pop_timeout(ptr, 100);
             // handle msg
             if (rc == zbf::SQ_POP_SUCCESS) {
                 tcp_message* msg = ptr.get();
@@ -723,7 +681,6 @@ private:
                         reqStat.onReqFinish(msgType);
                     }
                 }
-                user_sp->markMsgHandled(msg);
                 // ptr destructor deletes msg
                 std::this_thread::yield();
             } else if (rc == zbf::SQ_EXIT) {
@@ -766,7 +723,7 @@ private:
         // push msg to worker queue
         TcpMsgPtr ptr(msg, user->weak_from_this());
         LOG_MSG(LogLevel::TraceMore, "dispatch msg(%s) to worker(%d)", msg->desc().c_str(), wkId);
-        if (!_recvQueue[wkId]->push(std::move(ptr))) {
+        if (!_recvQueues[workerIndex(wkId)]->push(std::move(ptr))) {
             LOG_ERR_MSG("dispatchMsg fail, queue is full, msg=%s", msg->desc().c_str());
             // TcpMsgPtr destructor deletes msg
         }
@@ -775,6 +732,9 @@ private:
     std::string desc() {
         return std::string("tcpsock_server");
     }
+
+    static short workerId(short i) { return ThdIdBase + 10 + i; }
+    static short workerIndex(short thdId) { return thdId - ThdIdBase - 11; }
 
 protected:
     enum { StatInterval = 5, ThreadIdle = 20, EpollWait = 50, BufferSize = 4096, BackLog = 128, ThdIdBase = 200, DefaultMsgType = 0, DefaultMaxConns = 6000 };
@@ -790,15 +750,13 @@ private:
     std::thread _iothread;
     std::thread _monitor;
     std::vector<std::thread*> _workers;
-    std::unordered_map<short, SafeQueuePtr> _recvQueue;
+    std::array<SafeQueuePtr, 64> _recvQueues;
 
     std::list<std::shared_ptr<tcpsock_user>> _users;
     std::mutex _lockUS;
     std::unordered_map<int, std::shared_ptr<tcpsock_user>> _fd2user;
     std::mutex _lockF2U;
-    std::list<std::shared_ptr<tcpsock_user>> _closedUsers;
-    std::mutex _lockCU;
-    
+
     std::vector<short> _workerIds;
     std::unordered_map<uint32_t, WorkerIdGroup> _msgTyp2WkIdGrp;
     std::mutex _lockMT2WI;
@@ -829,7 +787,7 @@ public:
     }
 
     // RET: 0=success, non-zero=fail
-    int connect(int timeout = 2000, bool logErr = true) {
+    int connect(int timeout_ms, bool logErr = true) {
         _closed = false;
         disconnect(); // reset _fd
         
@@ -864,7 +822,7 @@ public:
                 if (logErr) LOG_ERR_MSG("connect fail(%s)", addrAndPort.c_str());
                 EXIT_RC(rc, -3);
             }
-            if (!socket_utils::checkSockStat(fd, 2, timeout, logErr)) {
+            if (!socket_utils::checkSockStat(fd, 2, timeout_ms, logErr)) {
                 if (logErr) LOG_ERR_MSG("checkSockStat fail(%s)", addrAndPort.c_str());
                 EXIT_RC(rc, -4);
             }
@@ -881,7 +839,7 @@ public:
 exit:
         if (rc) {
             if (fd != INVALID_SOCK) CLOSE_SOCKET(fd);
-            if (logErr) LOG_ERR_MSG("client connect fail(%s), rc=%d", addrAndPort.c_str(), rc);
+            if (logErr) LOG_ERR_MSG("client(%s) connect fail, rc=%d", desc(false).c_str(), rc);
         }
         if (svr_addr) freeaddrinfo(svr_addr);
         return rc;
@@ -1122,7 +1080,7 @@ public:
 private:
     tcpsock_client* createClient() {
         tcpsock_client* clt = new tcpsock_client(_serverAddr.c_str(), _serverPort, _protocol.get(), clientSeq(), _poolName.c_str());
-        int rc = clt->connect();
+        int rc = clt->connect(100);
         updatePoolState(rc);
         LOG_MSG(LogLevel::Debug, "createClient(%s), connect=%d", clt->desc().c_str(), rc);
         return clt;
@@ -1139,7 +1097,7 @@ private:
             }
         }
         if (newClt) {
-            int rc = newClt->connect();
+            int rc = newClt->connect(100);
             updatePoolState(rc);
             LOG_MSG(LogLevel::Debug, "createClient(%s), connect=%d", newClt->desc().c_str(), rc);
             std::lock_guard<std::mutex> lock(_lockClients);
@@ -1387,7 +1345,7 @@ public:
     // add one client: addr:port
     void addConnect(const char* addr, unsigned short port, tcp_message_protocol* protocol) {
         tcpsock_asynclt* asynclt = new tcpsock_asynclt(addr, port, protocol, _cltSeq.fetch_add(1, std::memory_order_relaxed), _name.c_str());
-        asynclt->connect();
+        asynclt->connect(100);
         std::lock_guard<std::mutex> lock(_lockClients);
         _clients.push_back(asynclt);
     }
@@ -1684,8 +1642,7 @@ private:
                             addMonitored(asynclt);
                             LOG_MSG(LogLevel::Debug, "start monitor (%s)", asynclt->desc().c_str());
                         } else {
-                            // connect: 0=success -> !0=true -> enter addMonitored
-                            if (!asynclt->connect(1000, false)) {
+                            if (0 == asynclt->connect(500, false)) {
                                 addMonitored(asynclt);
                                 LOG_MSG(LogLevel::Debug, "start monitor (%s)", asynclt->desc().c_str());
                             }
@@ -1794,7 +1751,7 @@ private:
     std::mutex _lockWorker;
     std::condition_variable _cvWorker;
     
-    enum { BufferSize = 4096, ThdIdBase = 300, ThreadIdle = 20, EpollWait = 50 };
+    enum { BufferSize = 4096, ThdIdBase = 300, ThreadIdle = 20, EpollWait = 50};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

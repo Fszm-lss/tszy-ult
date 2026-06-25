@@ -8,9 +8,9 @@ using namespace fszm;
 
 class listener : public kcpsock_listener {
 public:
-	void onRecvMsg(std::shared_ptr<kcp_user> user, const tcp_message* msg) {
+	void onRecvMsg(std::shared_ptr<kcp_user> user, std::unique_ptr<tcp_message> msg) override {
         std::string body(msg->data.begin() + user->getProtocol()->headerSize(), msg->data.end());
-        LOG_MSG(LogLevel::Info, "onRecv, sz=%zu, body=%s", msg->data.size(), body.c_str());
+        LOG_MSG(LogLevel::Info, "onRecvMsg, sz=%zu, body=%s", msg->data.size(), body.c_str());
     }
 };
 

@@ -450,6 +450,17 @@ public:
 #endif
     }
 
+    static int setKeepAlive(int fd) {
+        int on = 1;
+        socklen_t len = sizeof(on);
+        if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, SOCK_OPT_CVAL(on), len) < 0) {
+            LOG_LAST_ERR("setsockopt(SO_KEEPALIVE) fail, fd=%d", fd);
+            return -1;
+        }
+        LOG_MSG(LogLevel::Trace, "%s success, fd=%d, val=%d", __FUNCTION__, fd, on);
+        return 0;
+    }
+
     // allow IPv6 socket to accept v4 connections (dual-stack)
     // on Linux it's the default; on Windows IPV6_V6ONLY=1 by default, must opt in
     static int setDualstack(int fd, int family) {

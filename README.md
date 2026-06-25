@@ -36,6 +36,8 @@ cmake --build --preset debug
 cmake --build --preset debug --target lygate
 ```
 
+Post-build: `lycentral` and `testsslv2` auto-copy their required files (`lycentral-conf.json` and `test/key/`) to the build directory.
+
 Available build targets: `tcpserver`, `tcpcltpool`, `lycentral`, `lylogic`, `lycommon`, `lycomasynclt`, `lygate`, `lygateclt`, `testsslv2`, `testhandshake`, `kcpserverv2`, `kcpclientv2`, `asio_tcpserver`, `asio_tcpclient`.
 
 | Preset | Build Type | Platform |
@@ -171,9 +173,9 @@ To run the full server cluster (in order):
 ./lylogic
 # 3. Start the common proxy (port 35102, proxies to logic)
 ./lycommon
-# 4. Start the gateway (port 35105, needs RSA private key)
+# 4. Start the gateway (port 35105, needs key/rsa_private_key.pem)
 ./lygate
-# 5. Test with encrypted client or direct async client
+# 5. Test: encrypted client (needs key/rsa_public_key.pem) or direct async client
 ./lygateclt
 ./lycomasynclt
 ```

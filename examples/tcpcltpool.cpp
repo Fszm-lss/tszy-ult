@@ -69,7 +69,7 @@ int main(int argc, char** argv)
     // tell server quit
     std::string quit = "QUIT";
     tcpsock_client clt("127.0.0.1", 4701, proto);
-    clt.connect();
+    clt.connect(200);
     tcp_message* msg = proto->genMessage(0x10, quit);
     clt.send(msg);
     delete msg;

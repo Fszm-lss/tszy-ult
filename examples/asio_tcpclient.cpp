@@ -8,18 +8,18 @@ int g_recvMsgs = 0;
 
 class listener : public tcpsock_listener {
 public:
-    virtual void on_connect(std::shared_ptr<tcpsock_user> user) override {
-        LOG_MSG(LogLevel::Info, "(%s) on_connect", user->desc().c_str());
+    virtual void onConnect(std::shared_ptr<tcpsock_user> user) override {
+        LOG_MSG(LogLevel::Info, "(%s) onConnect", user->desc().c_str());
     }
 
-    virtual void on_message(std::shared_ptr<tcpsock_user> user, std::unique_ptr<tcp_message> msg) override {
+    virtual void onRecvMsg(std::shared_ptr<tcpsock_user> user, std::unique_ptr<tcp_message> msg) override {
         std::string strMsg(msg->data.data() + sizeof(uint32_t), msg->data.size() - sizeof(uint32_t));
-        LOG_MSG(LogLevel::Info, "(%s) on_message: %s", user->desc().c_str(), strMsg.c_str());
+        LOG_MSG(LogLevel::Info, "(%s) onRecvMsg: %s", user->desc().c_str(), strMsg.c_str());
         LOG_MSG(LogLevel::Info, "(%s) total recv: %d", user->desc().c_str(), ++g_recvMsgs);
     }
 
-    virtual void on_disconnect(std::shared_ptr<tcpsock_user> user) override {
-        LOG_MSG(LogLevel::Info, "(%s) on_disconnect", user->desc().c_str());
+    virtual void onDisconnect(std::shared_ptr<tcpsock_user> user) override {
+        LOG_MSG(LogLevel::Info, "(%s) onDisconnect", user->desc().c_str());
     }
 };
 

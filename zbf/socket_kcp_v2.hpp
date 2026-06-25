@@ -226,17 +226,15 @@ private:
     bool                             _serverSide;
     heartbeat_helper                 _hbhelper;
     TimeUnitMillSec                  _startupTime;
-    // data race on reader/writer: benign because aligned 64-bit write is atomic on x86;
-    // worst case is one-cycle misjudgment, self-corrects next cycle.
-    // TODO: change to std::atomic if tsan warns.
-    TimeUnitMillSec                  _nextUpdateMs{0};
+    std::atomic<TimeUnitMillSec>     _nextUpdateMs{0};
 };
 
 
 class kcpsock_listener {
 public:
-	virtual void onRecvMsg(std::shared_ptr<kcp_user> user, const tcp_message* msg) = 0;
-    virtual void onUserDisconnect(std::shared_ptr<kcp_user> user) {};
+    virtual void onConnect(std::shared_ptr<kcp_user> user) {};
+	virtual void onRecvMsg(std::shared_ptr<kcp_user> user, std::unique_ptr<tcp_message> msg) = 0;
+    virtual void onDisconnect(std::shared_ptr<kcp_user> user) {};
 };
 
 class kcpsock_server {
@@ -332,9 +330,12 @@ public:
             return -3;
         }
 
-        std::lock_guard<std::mutex> lock(_lockUsers);
-        _ident2User.insert(std::make_pair(ident, user));
-        _fd2User.insert(std::make_pair(fd, user));
+        {
+            std::lock_guard<std::mutex> lock(_lockUsers);
+            _ident2User.insert(std::make_pair(ident, user));
+            _fd2User.insert(std::make_pair(fd, user));
+        }
+        _listener->onConnect(user);
         LOG_MSG(LogLevel::Debug, "%s addUser(%s)", desc().c_str(), user->desc().c_str());
         return 0;
     }
@@ -483,7 +484,7 @@ private:
                     closeUser(user->fd, "user expired");
                 }
                 if (user->isClosed()) {
-                    _listener->onUserDisconnect(user);
+                    _listener->onDisconnect(user);
                     {
                         std::lock_guard<std::mutex> lock(_lockUsers);
                         _ident2User.erase(user->conv);
@@ -518,12 +519,12 @@ private:
             int rc = _rdQueue.pop_timeout(pair, 100);
             if (rc == zbf::SQ_POP_SUCCESS) {
                 auto user = pair.user.lock();
-                tcp_message* msg = pair.get();
                 if (!user) continue;
                 if (!user->isClosed()) {
-                    uint32_t msgType = _protocol->type(msg);
+                    auto msg = std::move(pair.msg);
+                    uint32_t msgType = _protocol->type(msg.get());
                     reqStat.onReqStart(msgType);
-                    _listener->onRecvMsg(user, msg);
+                    _listener->onRecvMsg(user, std::move(msg));
                     reqStat.onReqFinish(msgType);
                 }
                 std::this_thread::yield();
@@ -642,8 +643,7 @@ private:
                 _user->onInput(recvBuf, recvLen);
                 tcp_message* msg = nullptr;
                 while ((msg = _user->onRecv())) {
-                    _listener->onRecvMsg(_user, msg);
-                    delete msg;
+                    _listener->onRecvMsg(_user, std::unique_ptr<tcp_message>(msg));
                 }
                 // flush ACK immediately after receiving data
                 _user->onUpdate(loopStart);

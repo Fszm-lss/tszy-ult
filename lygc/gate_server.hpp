@@ -5,9 +5,11 @@
 
 namespace lygc {
 
+class GateServer;
+
 class GateUser : public NetUser {
 public:
-    using NetUser::NetUser;
+    GateUser(NetServer* base, uint16_t origin);
 
     virtual void onRequest(const lymsg_header* reqHeader, const std::string& reqData) override;
 
@@ -30,22 +32,22 @@ private:
         _handshakeFin.store(false);
     }
 
-    std::string decrypt(const std::string& data) {
-        std::string result;
-        int rc = openssl_utils::symmetric_encrypt(data, _secret, _ivec, _enctype, false, result);
+    bool decrypt(const std::string& data, std::string& out) {
+        int rc = openssl_utils::symmetric_encrypt(data, _secret, _ivec, _enctype, false, out);
         if (rc) {
             LOG_ERR_MSG("symmetric decrypt fail, rc=%d, size=%d", rc, data.size());
+            return false;
         }
-        return result;
+        return true;
     }
 
-    std::string encrypt(const std::string& data) {
-        std::string result;
-        int rc = openssl_utils::symmetric_encrypt(data, _secret, _ivec, _enctype, true, result);
+    bool encrypt(const std::string& data, std::string& out) {
+        int rc = openssl_utils::symmetric_encrypt(data, _secret, _ivec, _enctype, true, out);
         if (rc) {
             LOG_ERR_MSG("symmetric encrypt fail, rc=%d, size=%d", rc, data.size());
+            return false;
         }
-        return result;
+        return true;
     }
 
     bool isHandshakeDone() {
@@ -53,6 +55,7 @@ private:
     }
 
 private:
+    GateServer* _gateServer;
     std::string _secret;
     std::string _ivec;
     openssl_utils::eEncryptType _enctype{openssl_utils::eEncryptType::eET_AES_CFB};
@@ -102,35 +105,38 @@ private:
     openssl_utils::eEncryptType _session_symsec_type{openssl_utils::eEncryptType::eET_AES_CFB};
 };
 
+GateUser::GateUser(NetServer* base, uint16_t origin) : NetUser(base, origin), _gateServer(dynamic_cast<GateServer*>(base)) { }
+
 void GateUser::onRequest(const lymsg_header* reqHeader, const std::string& reqData) {
-    GateServer* gateServer = dynamic_cast<GateServer*>(_baseServer);
     if (reqHeader->type == LYMSG_TYPE_HANDSHAKE) {
         std::string shareKey;
-        std::string respData = gateServer->onHandshake(reqData, shareKey);
+        std::string respData = _gateServer->onHandshake(reqData, shareKey);
         if (respData.empty()) { // handshake fail
             setHandshakeFail();
             LOG_ERR_MSG("handshake fail, reply empty string");
             this->post(std::unique_ptr<tcp_message>(NetUser::createResponse(reqHeader, std::string())));
         } else {
-            setHandshakeSuccess(shareKey, gateServer->getSessionSecType());
+            setHandshakeSuccess(shareKey, _gateServer->getSessionSecType());
             LOG_MSG(LogLevel::Debug, "handshake success, response size=%d", respData.size());
             this->post(std::unique_ptr<tcp_message>(NetUser::createResponse(reqHeader, respData)));
         }
     } else {
-        std::string plainReqData;
         if (reqHeader->type & LYMSG_TYPE_ENC) { // encrypt msg
             if (isHandshakeDone()) {
                 LOG_MSG(LogLevel::TraceMore, "decrypt request, size=%d", reqData.size());
-                plainReqData = decrypt(reqData);
+                std::string decrypted;
+                if (!decrypt(reqData, decrypted)) {
+                    return;
+                }
+                NetUser::onRequest(reqHeader, std::move(decrypted));
             } else {
                 LOG_ERR_MSG("reject request before handshake, size=%d", reqData.size());
                 return;
             }
         } else { // plain msg
             LOG_MSG(LogLevel::TraceMore, "plain request, size=%d", reqData.size());
-            plainReqData = reqData;
+            NetUser::onRequest(reqHeader, reqData);
         }
-        NetUser::onRequest(reqHeader, plainReqData);
     }
 }
 
@@ -139,7 +145,11 @@ tcp_message* GateUser::createResponse(const lymsg_header* reqHeader, const std::
     if (reqHeader->type & LYMSG_TYPE_ENC) {
         if (isHandshakeDone()) {
             LOG_MSG(LogLevel::TraceMore, "encrypt response, size=%d", respData.size());
-            packData = encrypt(respData);
+            if (!encrypt(respData, packData)) {
+                // encryption failure means session key is stale, reply empty body
+                // to signal the client to re-handshake instead of hanging on timeout
+                packData.clear();
+            }
         } else {
             LOG_ERR_MSG("unexpected response before handshake, size=%d", respData.size());
             packData = "";

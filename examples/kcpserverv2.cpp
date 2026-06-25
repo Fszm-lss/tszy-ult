@@ -45,9 +45,9 @@ UserParamMgr* g_upMgr = nullptr;
 
 class listener : public kcpsock_listener {
 public:
-	void onRecvMsg(std::shared_ptr<kcp_user> user, const tcp_message* msg) {
+	void onRecvMsg(std::shared_ptr<kcp_user> user, std::unique_ptr<tcp_message> msg) override {
         std::string body(msg->data.begin() + user->getProtocol()->headerSize(), msg->data.end());
-        LOG_MSG(LogLevel::Info, "onRecv(%s), body=%s", user->desc().c_str(), body.c_str());
+        LOG_MSG(LogLevel::Info, "onRecvMsg(%s), body=%s", user->desc().c_str(), body.c_str());
         // echo with type 0x42
         tcp_message* resp = dynamic_cast<default_msg_proto*>(user->getProtocol())->genMessage(0x42, body);
         if (resp && user->post(std::unique_ptr<tcp_message>(resp))) {
@@ -55,8 +55,8 @@ public:
         }
     }
 
-    void onUserDisconnect(std::shared_ptr<kcp_user> user) {
-        LOG_MSG(LogLevel::Info, "onUserDisconnect(%s), conv=%d, peerPort=%d", user->desc().c_str(), user->conv, user->peerPort);
+    void onDisconnect(std::shared_ptr<kcp_user> user) override {
+        LOG_MSG(LogLevel::Info, "onDisconnect(%s), conv=%d, peerPort=%d", user->desc().c_str(), user->conv, user->peerPort);
         g_upMgr->push(user->conv, user->peerPort);
     }
 };

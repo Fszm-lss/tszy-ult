@@ -2,9 +2,12 @@
 #define net_server_hpp
 // 2025-9
 
+#include <array>
 #include <atomic>
-#include <list>
+#include <functional>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 
 #include "lymsg_protocol.hpp"
@@ -43,7 +46,7 @@ public:
 
     virtual void onConnect() override { }
 
-    virtual void onDisconnect() override;
+    virtual void onDisconnect() override { }
 
     virtual void onRecvMsg(const tcp_message* msg) override {
         lymsg_header reqHeader;
@@ -144,16 +147,13 @@ private:
 };
 
 struct ReqContext : object_tracker<ReqContext> {
-    NetUser* user;
-    lygc::lymsg_header* reqHeader;
+    std::weak_ptr<tcpsock_user> userWeak;
+    lymsg_header reqHeader;
     std::string reqData;
     
-    ReqContext(NetUser* u, const lymsg_header* header, const std::string& data): user(u) {
-        reqHeader = lymsg_helper::copyHeader(header);
+    ReqContext(std::weak_ptr<tcpsock_user> u, const lymsg_header* header, const std::string& data): userWeak(u) {
+        memcpy(&reqHeader, header, sizeof(lymsg_header));
         reqData = data;
-    }
-    ~ReqContext() {
-        if (reqHeader) delete reqHeader;
     }
 };
 
@@ -239,13 +239,13 @@ public:
 
 public:
     void registerUserHandler(unsigned short origin, UserHandler* handler) {
-        std::lock_guard<std::mutex> lock(_lockUserHandlers);
+        std::lock_guard<std::shared_mutex> lock(_lockUserHandlers);
         unsigned int key = origin;
         _userHandlers[key] = handler;
     }
 
     UserHandler* getUserHandler(unsigned short origin) {
-        std::lock_guard<std::mutex> lock(_lockUserHandlers);
+        std::shared_lock<std::shared_mutex> lock(_lockUserHandlers);
         unsigned int key = origin;
         UserHandler* handler = nullptr;
         auto it = _userHandlers.find(key);
@@ -256,58 +256,49 @@ public:
     }
 
     void saveReqContext(request_id_t reqId, NetUser* user, const lymsg_header* reqHeader, const std::string& reqData) {
-        std::lock_guard<std::mutex> lock(_lockReqContext);
-        ReqContext* ctx = new ReqContext(user, reqHeader, reqData);
-        _reqContext.insert(std::pair<request_id_t, ReqContext*>(reqId, ctx));
-        _user2ReqIds[user].push_back(reqId);
-        LOG_MSG(LogLevel::Trace, "%s, id=%lu, req=%s", __FUNCTION__, reqId, LYMSG_DESC(ctx->reqHeader).c_str());
+        auto userShared = user->shared_from_this();
+        ReqContext* ctx = new ReqContext(userShared, reqHeader, reqData);
+        auto& shard = _reqShards[shardIdx(reqId)];
+        std::lock_guard<std::mutex> lock(shard.lock);
+        shard.map.insert(std::make_pair(reqId, ctx));
+        LOG_MSG(LogLevel::Trace, "%s, id=%lu, req=%s", __FUNCTION__, reqId, LYMSG_DESC(&ctx->reqHeader).c_str());
     }
 
     int response(request_id_t reqId, const std::string& respData) {
-        int rc = 0;
-        std::lock_guard<std::mutex> lock(_lockReqContext);
-        auto it = _reqContext.find(reqId);
-        if (it != _reqContext.end()) {
-            ReqContext* ctx = it->second;
-            NetUser* user = ctx->user;
-            tcp_message* resp = user->createResponse(ctx->reqHeader, respData);
-            LOG_MSG(LogLevel::Trace, "%s success, id=%lu, req=%s, respSz=%lu", __FUNCTION__, reqId, 
-                LYMSG_DESC(ctx->reqHeader).c_str(), respData.size());
-            user->postMsg(std::unique_ptr<tcp_message>(resp));
-
-            _user2ReqIds[user].remove(reqId);
-            _reqContext.erase(it);
-            delete ctx;
-        } else {
-            rc = -1;
-            LOG_ERR_MSG("%s fail, id=%lu", __FUNCTION__, reqId);
+        ReqContext* ctx = nullptr;
+        {
+            auto& shard = _reqShards[shardIdx(reqId)];
+            std::lock_guard<std::mutex> lock(shard.lock);
+            auto it = shard.map.find(reqId);
+            if (it != shard.map.end()) {
+                ctx = it->second;
+                shard.map.erase(it);
+            }
         }
-        return rc;
+        if (!ctx) {
+            LOG_ERR_MSG("%s fail: ctx not found, id=%lu, respSz=%lu", __FUNCTION__, reqId, respData.size());
+            return -1;
+        }
+
+        auto user = std::dynamic_pointer_cast<NetUser>(ctx->userWeak.lock());
+        if (!user) {
+            LOG_MSG(LogLevel::Trace, "%s user gone, id=%lu, req=%s", __FUNCTION__, reqId, LYMSG_DESC(&ctx->reqHeader).c_str());
+            delete ctx;
+            return -1;
+        }
+
+        tcp_message* resp = user->createResponse(&ctx->reqHeader, respData);
+        user->postMsg(std::unique_ptr<tcp_message>(resp));
+        LOG_MSG(LogLevel::Trace, "%s success, id=%lu, req=%s, respSz=%lu", __FUNCTION__, reqId, 
+            LYMSG_DESC(&ctx->reqHeader).c_str(), respData.size());
+        delete ctx;
+        return 0;
     }
 
 public:
     request_id_t genRequestId() {
-        request_id_t reqId = _reqIdCreator.fetch_add(1, std::memory_order_seq_cst);
+        request_id_t reqId = _reqIdCreator.fetch_add(1, std::memory_order_relaxed);
         return reqId;
-    }
-
-    void onUserDisconnect(NetUser* user) {
-        // remove pendding ReqContext
-        std::lock_guard<std::mutex> lock(_lockReqContext);
-        auto it = _user2ReqIds.find(user);
-        int pendding = 0;
-        if (it != _user2ReqIds.end()) {
-            pendding = it->second.size();
-            for (request_id_t id : it->second) {
-                auto result = _reqContext.find(id);
-                if (result != _reqContext.end()) {
-                    delete result->second;
-                    _reqContext.erase(result);
-                }
-            }
-            _user2ReqIds.erase(it);
-        }
-        LOG_MSG(LogLevel::Debug, "onUserDisconnect(%s), pendding request=%lu", user->desc().c_str(), pendding);
     }
 
     uint16_t origin() {
@@ -321,13 +312,22 @@ public:
 protected:
     ServerConfig _config;
     std::unordered_map<unsigned int, UserHandler*> _userHandlers;
-    std::mutex _lockUserHandlers;
+    std::shared_mutex _lockUserHandlers;
 
-    std::unordered_map<request_id_t, ReqContext*> _reqContext;
-    std::unordered_map<NetUser*, std::list<request_id_t> > _user2ReqIds;
-    std::mutex _lockReqContext; // lock _reqContext & _user2ReqIds
+    static constexpr size_t REQ_SHARD_BITS = 4;
+    static constexpr size_t REQ_SHARD_COUNT = 1 << REQ_SHARD_BITS;
+
+    struct ReqShard {
+        std::mutex lock;
+        std::unordered_map<request_id_t, ReqContext*> map;
+    };
+    std::array<ReqShard, REQ_SHARD_COUNT> _reqShards;
+
+    static size_t shardIdx(request_id_t reqId) {
+        return reqId & (REQ_SHARD_COUNT - 1);
+    }
+
     std::atomic<request_id_t> _reqIdCreator;
-
     bool _startAsyncMgr{false};
     async_client_manager _asynCltMgr;
     zbf::timer_helper _timerHelper;
@@ -352,10 +352,6 @@ void NetUser::onRequest(const lymsg_header* reqHeader, const std::string& reqDat
     } else {
         LOG_ERR_MSG("no matched handler: msg=%s", LYMSG_DESC(reqHeader).c_str());
     }
-}
-
-void NetUser::onDisconnect() {
-    _baseServer->onUserDisconnect(this);
 }
 
 }
