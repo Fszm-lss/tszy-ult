@@ -26,13 +26,13 @@ void worker(void* param) {
     common_client* client = (common_client*) param;
     lymsg_header header;
     // char szMsg[64] = {0};
-    int length = fszm::random_utils::randomNumber(512, 16384); // 0.5K ~ 16k
+    int length = fszm::random_utils::randomNumber(8, 16); // 0.5K ~ 16k
     std::string randstr = fszm::random_utils::randomString(fszm::NumbersAndLetters, length);
-    for (int i = 1; i <= 10; ++i) {
+    for (int i = 1; i <= 5; ++i) {
         // snprintf(szMsg, sizeof(szMsg), "Yekajielinna_%d", i);
 
-        header.origin = LYCOMMON_CLIENT_ORGIN;
-        header.type = 0x20;
+        header.origin = LYDBAGENT_CLIENT_ORGIN;
+        header.type = 0x20 + i;
         header.serial = i;
 
         json jobj;
@@ -49,7 +49,7 @@ void worker(void* param) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     g_asyncMgr->stop();
 }
 
@@ -67,9 +67,7 @@ int main(int argc, char** argv)
     async_client_manager cltMgr(proto);
     g_asyncMgr = &cltMgr;    
     common_client* client = new common_client();
-    client->addConnect("127.0.0.1", 35102, proto);
-    client->addConnect("127.0.0.1", 35112, proto); // would fail
-    client->addConnect("::1", 35102, proto);
+    client->addConnect("127.0.0.1", 35106, proto);
     cltMgr.manageClient(client);
     cltMgr.start(1);
 

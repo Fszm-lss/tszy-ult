@@ -75,6 +75,7 @@ inline void ntoh(lymsg_header&) {}
 #define LYMSG_TYPE_HANDSHAKE     0x00000011 // handshake msg
 #define LYMSG_TYPE_DB_MYSQL      0x00000021 
 #define LYMSG_TYPE_DB_MONGO      0x00000022
+#define LYMSG_TYPE_DB_REDIS      0x00000023
 #define LYMSG_TYPE_RESERVE       0x000000FF
 
 #define LYMSG_DESC(pHeader)  lygc::lymsg_helper::lymsg_desc(pHeader)

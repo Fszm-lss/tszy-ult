@@ -170,14 +170,14 @@ void onExit() {
 int main(int argc, char** argv)
 {
     std::atexit(onExit);
-    std::string log_path = log_utils::createLogPath();
+    std::string log_path = log_utils::createLogPath(false);
     log_utils::open(log_path.c_str(), LogLevel::Trace);
 
     lymsg_protocol* proto = new lymsg_protocol;
     async_client_manager cltMgr(proto);
     g_asyncMgr = &cltMgr;
     common_client* client = new common_client();
-    client->addConnect("127.0.0.1", 35105, proto);
+    client->addConnect("127.0.0.1", 35107, proto);
     cltMgr.manageClient(client);
     cltMgr.start(1);
 

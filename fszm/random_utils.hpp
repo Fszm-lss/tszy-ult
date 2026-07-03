@@ -22,12 +22,14 @@ enum RandomStringType {
 
 class random_utils {
 public:
+    // returns [0, INT_MAX]
     static int randomNumber() {
         std::mt19937& engine = get_thread_local_engine();
         std::uniform_int_distribution<int> dist(0, std::numeric_limits<int>::max());
         return dist(engine);
     }
 
+    // returns [0, range - 1]
     static int randomNumber(int range) {
         if (range <= 0) return 0;
         std::mt19937& engine = get_thread_local_engine();
@@ -35,6 +37,7 @@ public:
         return dist(engine);
     }
 
+    // returns [min, max] (inclusive)
     static int randomNumber(int min, int max) {
         if (min > max) std::swap(min, max);
         std::mt19937& engine = get_thread_local_engine();

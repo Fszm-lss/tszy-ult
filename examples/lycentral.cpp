@@ -19,7 +19,7 @@ int main(int argc, char** argv)
 {
     signal_utils::ignoreSignal(SIGPIPE);
     signal_utils::handleSignal(onSignal, {SIGINT, SIGTERM});
-    std::string log_path = log_utils::createLogPath();
+    std::string log_path = log_utils::createLogPath(false);
     log_utils::open(log_path.c_str(), LogLevel::Trace);
     
     std::string data;

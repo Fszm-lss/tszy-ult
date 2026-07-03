@@ -46,7 +46,7 @@ public:
 
     virtual void onConnect() override { }
 
-    virtual void onDisconnect() override { }
+    virtual void onDisconnect() override;
 
     virtual void onRecvMsg(const tcp_message* msg) override {
         lymsg_header reqHeader;
@@ -221,6 +221,7 @@ public:
             delete handler;
         }
         _userHandlers.clear();
+        // _reqShards auto-destroys remaining ReqContext via unique_ptr
     }
 
     virtual tcpsock_user* createUser() override {
@@ -257,21 +258,21 @@ public:
 
     void saveReqContext(request_id_t reqId, NetUser* user, const lymsg_header* reqHeader, const std::string& reqData) {
         auto userShared = user->shared_from_this();
-        ReqContext* ctx = new ReqContext(userShared, reqHeader, reqData);
+        auto ctx = std::make_unique<ReqContext>(userShared, reqHeader, reqData);
+        LOG_MSG(LogLevel::Trace, "%s, id=%lu, req=%s", __FUNCTION__, reqId, LYMSG_DESC(&ctx->reqHeader).c_str());
         auto& shard = _reqShards[shardIdx(reqId)];
         std::lock_guard<std::mutex> lock(shard.lock);
-        shard.map.insert(std::make_pair(reqId, ctx));
-        LOG_MSG(LogLevel::Trace, "%s, id=%lu, req=%s", __FUNCTION__, reqId, LYMSG_DESC(&ctx->reqHeader).c_str());
+        shard.map.insert(std::make_pair(reqId, std::move(ctx)));
     }
 
     int response(request_id_t reqId, const std::string& respData) {
-        ReqContext* ctx = nullptr;
+        std::unique_ptr<ReqContext> ctx;
         {
             auto& shard = _reqShards[shardIdx(reqId)];
             std::lock_guard<std::mutex> lock(shard.lock);
             auto it = shard.map.find(reqId);
             if (it != shard.map.end()) {
-                ctx = it->second;
+                ctx = std::move(it->second);
                 shard.map.erase(it);
             }
         }
@@ -283,7 +284,6 @@ public:
         auto user = std::dynamic_pointer_cast<NetUser>(ctx->userWeak.lock());
         if (!user) {
             LOG_MSG(LogLevel::Trace, "%s user gone, id=%lu, req=%s", __FUNCTION__, reqId, LYMSG_DESC(&ctx->reqHeader).c_str());
-            delete ctx;
             return -1;
         }
 
@@ -291,8 +291,24 @@ public:
         user->postMsg(std::unique_ptr<tcp_message>(resp));
         LOG_MSG(LogLevel::Trace, "%s success, id=%lu, req=%s, respSz=%lu", __FUNCTION__, reqId, 
             LYMSG_DESC(&ctx->reqHeader).c_str(), respData.size());
-        delete ctx;
         return 0;
+    }
+
+    // Clean up all pending contexts for a disconnected user
+    void cleanupUserContext(NetUser* user) {
+        auto userShared = user->shared_from_this();
+        for (auto& shard : _reqShards) {
+            std::lock_guard<std::mutex> shardLock(shard.lock);
+            auto it = shard.map.begin();
+            while (it != shard.map.end()) {
+                auto ctxUser = it->second->userWeak.lock();
+                if (!ctxUser || ctxUser == userShared) {
+                    it = shard.map.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
     }
 
 public:
@@ -319,7 +335,7 @@ protected:
 
     struct ReqShard {
         std::mutex lock;
-        std::unordered_map<request_id_t, ReqContext*> map;
+        std::unordered_map<request_id_t, std::unique_ptr<ReqContext>> map;
     };
     std::array<ReqShard, REQ_SHARD_COUNT> _reqShards;
 
@@ -352,6 +368,10 @@ void NetUser::onRequest(const lymsg_header* reqHeader, const std::string& reqDat
     } else {
         LOG_ERR_MSG("no matched handler: msg=%s", LYMSG_DESC(reqHeader).c_str());
     }
+}
+
+void NetUser::onDisconnect() {
+    _baseServer->cleanupUserContext(this);
 }
 
 }

@@ -35,7 +35,7 @@ void onExit() {
 int main(int argc, char** argv)
 {
     std::atexit(onExit);
-    std::string log_path = log_utils::createLogPath();
+    std::string log_path = log_utils::createLogPath(false);
     log_utils::open(log_path.c_str(), LogLevel::Trace);
 
     default_msg_proto* proto = new default_msg_proto;

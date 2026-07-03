@@ -103,12 +103,22 @@ public:
             return 1;
         }
         _wrQueue.push_back(std::move(msg));
+        enableWrite(true);
         return 0;
     }
     
-    bool isQueueEmpty() {
+    void joinMonitor(int efd) {
         std::lock_guard<std::mutex> lock(_lockWRQ);
-        return _wrQueue.empty();
+        _enableWrite.store(false);
+        _efd.store(efd);
+        if (!_wrQueue.empty()) {
+            enableWrite(true);
+        }
+    }
+
+    void leaveMonitor() {
+        _efd.store(INVALID_SOCK);
+        _enableWrite.store(false);
     }
 
     std::string desc(bool brief = true) const {
@@ -121,9 +131,25 @@ public:
     }
 
 private:
+    void enableWrite(bool enable) {
+        int efd = _efd.load();
+        if (_fd == INVALID_SOCK || efd == INVALID_SOCK) return;
+        bool expected = !enable;
+        if (_enableWrite.compare_exchange_strong(expected, enable)) {
+            socket_poll::sp_enable(efd, _fd, true, enable);
+        }
+    }
+    
     int sendData() {
         if (isClosed()) return SOCK_CLOSED;
-        return zbf::_SendData(_fd, _wrQueue, _lockWRQ);
+        int rc = zbf::_SendData(_fd, _wrQueue, _lockWRQ);
+        if (rc == zbf::QUEUE_EMPTY) {
+            std::lock_guard<std::mutex> lock(_lockWRQ);
+            if (_wrQueue.empty()) {
+                enableWrite(false);
+            }
+        }
+        return rc;
     }
 
     int onRecv(memchunk* chunk) {
@@ -151,14 +177,6 @@ private:
 
     bool isExpired(TimeUnitSec now) {
         return _hbhelper.isExceed(now);
-    }
-
-    void enableWrite(int efd, bool enable) {
-        std::lock_guard<std::mutex> lock(_lockEW);
-        if (_enableWrite != enable) {
-            _enableWrite = enable;
-            socket_poll::sp_enable(efd, _fd, true, _enableWrite);
-        }
     }
 
     void uninit() {
@@ -192,8 +210,8 @@ private:
     bool _started{false};
     std::mutex _lockState;
     heartbeat_helper _hbhelper;
-    bool _enableWrite{false};
-    std::mutex _lockEW;
+    std::atomic<bool> _enableWrite{false};
+    std::atomic<int> _efd{INVALID_SOCK};
     tcp_message_protocol* _protocol{nullptr}; // ref
     enum { BufferSize = 1024, MaxPendingSize = 10485760 /*10M*/, MaxPendingMsg = 256, UserTimeout = 90 };
 };
@@ -468,6 +486,7 @@ private:
         }
 
         user->init(addr.c_str(), port, fd, _userSeq.fetch_add(1, std::memory_order_relaxed));
+        user->joinMonitor(_efd);
         user->setProtocol(_protocol.get());
         {
             std::lock_guard<std::mutex> lock(_lockF2U);
@@ -503,6 +522,7 @@ private:
             auto user = it->second;
             if (!user->isClosed()) {
                 user->setClose();
+                user->leaveMonitor();
                 socket_poll::sp_del(_efd, fd);
                 _fd2user.erase(fd);
                 rc = 0; // closed user
@@ -527,7 +547,7 @@ private:
         
         for (;;) {
             if (isShutDown()) break;
-            int n = socket_poll::sp_wait(_efd, ev, MAX_EVENT, EpollWait); // ms
+            int n = socket_poll::sp_wait(_efd, ev, MAX_EVENT, IOWait); // ms
             if (n < 0) {
                 LOG_LAST_ERR("sp_wait fail, efd=%d", _efd);
                 break;
@@ -589,9 +609,6 @@ private:
                             int rc = user->sendData();
                             if (rc == zbf::SEND_FAIL) {
                                 onIOError(fd, "write error");
-                            } else if (rc == zbf::QUEUE_EMPTY) {
-                                user->enableWrite(_efd, false);
-                                LOG_MSG(LogLevel::TraceMore, "ioprocessor: send suspend(%s), queue empty", user->desc().c_str());
                             }
                         }
                     } else if (ev[i].error || ev[i].eof) {
@@ -608,11 +625,9 @@ private:
         log_utils::registerThreadId(thdId);
         LOG_MSG(LogLevel::Debug, "%s monitor thread(%d) start", desc().c_str(), thdId);
         std::shared_ptr<tcpsock_user> user;
-        tcp_message* msg = nullptr;
-        int rc = 0;
         TimeUnitSec now = socket_utils::currentTimeSecs();
         int counter = 0;
-        const int update_time_interval = 1000/ThreadIdle; // almost 1s
+        const int update_time_interval = 1000/MonitorWait; // almost 1s
 
         for (;;) {
             if (isShutDown()) break;
@@ -633,15 +648,11 @@ private:
                 if (user->isClosed()) {
                     user->onDisconnect();
                 } else {
-                    // check if user need write
-                    if (!user->isQueueEmpty()) {
-                        user->enableWrite(_efd, true);
-                    }
                     pushUserBack(user);
                 }
                 std::this_thread::yield();
             } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(ThreadIdle));
+                std::this_thread::sleep_for(std::chrono::milliseconds(MonitorWait));
             }
         }
         LOG_MSG(LogLevel::Debug, "%s monitor thread(%d) exit", desc().c_str(), thdId);
@@ -651,9 +662,10 @@ private:
     int worker(short thdId) {
         log_utils::registerThreadId(thdId);
         LOG_MSG(LogLevel::Debug, "%s worker thread(%d) start", desc().c_str(), thdId);
-        RequestStat reqStat;
+        RequestStat reqStat(thdId);
         _statLogger.add(&reqStat);
 
+        int msgCount = 0;
         for (;;) {
             // get msg from worker queue
             TcpMsgPtr ptr;
@@ -671,14 +683,13 @@ private:
                 } else {
                     LOG_MSG(LogLevel::Trace, "recv msg(%s) from user(%s)", msg->desc().c_str(), user_sp->desc().c_str());
                     if (!user_sp->isClosed()) {
-                        // handle msg
                         uint32_t msgType = _protocol->type(msg);
                         reqStat.onReqStart(msgType);
                         user_sp->onRecvMsg(msg);
-                        if (!user_sp->isQueueEmpty()) {
-                            user_sp->enableWrite(_efd, true);
+                        reqStat.onReqFinish(msgType, static_cast<uint32_t>(msg->data.size()));
+                        if ((++msgCount & 0xF) == 0) {
+                            reqStat.sampleQueueDepth(static_cast<uint32_t>(_recvQueues[workerIndex(thdId)]->size()));
                         }
-                        reqStat.onReqFinish(msgType);
                     }
                 }
                 // ptr destructor deletes msg
@@ -737,7 +748,7 @@ private:
     static short workerIndex(short thdId) { return thdId - ThdIdBase - 11; }
 
 protected:
-    enum { StatInterval = 5, ThreadIdle = 20, EpollWait = 50, BufferSize = 4096, BackLog = 128, ThdIdBase = 200, DefaultMsgType = 0, DefaultMaxConns = 6000 };
+    enum { StatInterval = 5, MonitorWait = 50, IOWait = 50, BufferSize = 4096, BackLog = 128, ThdIdBase = 200, DefaultMsgType = 0, DefaultMaxConns = 6000 };
 
 private:
     std::unique_ptr<tcp_message_protocol> _protocol; // holder
@@ -1250,7 +1261,6 @@ public:
     tcpsock_asynclt(const char* addr, unsigned short port, tcp_message_protocol* protocol, unsigned long long seq = 0ULL, const char* owner = "") 
         : tcpsock_client(addr, port, protocol, seq, owner) {
         _recvCache = new memchunk(BufferSize);
-        _enableWrite = false;
     }
 
     virtual ~tcpsock_asynclt() {
@@ -1265,25 +1275,31 @@ public:
             return 1;
         }
         _wrQueue.push_back(std::move(msg));
+        enableWrite(true);
         return 0;
     }
 
-    bool isQueueEmpty() {
+    void joinMonitor(int efd) {
         std::lock_guard<std::mutex> lock(_lockWRQ);
-        return _wrQueue.empty();
-    }
-
-    void enableWrite(int efd, bool enable) {
-        std::lock_guard<std::mutex> lock(_lockEW);
-        if (_enableWrite != enable) {
-            _enableWrite = enable;
-            socket_poll::sp_enable(efd, _fd, true, _enableWrite);
+        _enableWrite.store(false);
+        _efd.store(efd);
+        if (!_wrQueue.empty()) {
+            enableWrite(true);
         }
     }
 
-    // reinit write status when add to epoll
-    void syncWriteStatus(bool enable) {
-        _enableWrite = enable;
+    void leaveMonitor() {
+        _efd.store(INVALID_SOCK);
+        _enableWrite.store(false);
+    }
+
+    void enableWrite(bool enable) {
+        int efd = _efd.load();
+        if (_fd == INVALID_SOCK || efd == INVALID_SOCK) return;
+        bool expected = !enable;
+        if (_enableWrite.compare_exchange_strong(expected, enable)) {
+            socket_poll::sp_enable(efd, _fd, true, enable);
+        }
     }
 
 public:
@@ -1292,6 +1308,11 @@ public:
         int rc = zbf::_SendData(_fd, _wrQueue, _lockWRQ);
         if (rc == zbf::SEND_SUCCESS) {
             flushAlive();
+        } else if (rc == zbf::QUEUE_EMPTY) {
+            std::lock_guard<std::mutex> lock(_lockWRQ);
+            if (_wrQueue.empty()) {
+                enableWrite(false);
+            }
         }
         return rc;
     }
@@ -1323,8 +1344,8 @@ private:
     std::mutex _lockRC;
     std::list<std::unique_ptr<tcp_message>> _wrQueue;
     std::mutex _lockWRQ;
-    bool _enableWrite;
-    std::mutex _lockEW;
+    std::atomic<bool> _enableWrite{false};
+    std::atomic<int> _efd{INVALID_SOCK};
     
     enum { BufferSize = 1024, MaxPendingSize = 10485760, MaxPendingMsg = 256 };
 };
@@ -1522,7 +1543,7 @@ private:
         if (socket_poll::sp_add(_efd, asynclt->getFd(), false)) {
             LOG_LAST_ERR("sp_add fail, efd=%d, fd=%d", _efd, asynclt->getFd());
         } else {
-            asynclt->syncWriteStatus(false);
+            asynclt->joinMonitor(_efd);
             _monitorColl.insert(asynclt);
             _fd2client.insert(std::make_pair(asynclt->getFd(), asynclt));
         }
@@ -1530,6 +1551,7 @@ private:
 
     void removeMonitored(tcpsock_asynclt* asynclt) {
         std::lock_guard<std::mutex> lock(_lockMonitorColl);
+        asynclt->leaveMonitor();
         socket_poll::sp_del(_efd, asynclt->getFd());
         _monitorColl.erase(asynclt);
         _fd2client.erase(asynclt->getFd());
@@ -1563,7 +1585,7 @@ private:
         for (;;) {
             if (isShutDown()) break;
 
-            int n = socket_poll::sp_wait(_efd, ev, MAX_EVENT, EpollWait);
+            int n = socket_poll::sp_wait(_efd, ev, MAX_EVENT, IOWait);
             if (n < 0) {
                 LOG_LAST_ERR("sp_wait fail, efd=%d", _efd);
                 break;
@@ -1596,9 +1618,6 @@ private:
                         int rc = asynclt->sendData();
                         if (rc == zbf::SEND_FAIL) {
                             onIOError(fd, asynclt, "write");
-                        } else if (rc == zbf::QUEUE_EMPTY) {
-                            asynclt->enableWrite(_efd, false);
-                            LOG_MSG(LogLevel::TraceMore, "ioprocessor send suspend(%s), queue empty", asynclt->desc().c_str());
                         }
                     }
                 } else if (ev[i].error || ev[i].eof) {
@@ -1617,7 +1636,7 @@ private:
         log_utils::registerThreadId(thdId);
         LOG_MSG(LogLevel::Debug, "%s monitor thread(%d) start", desc().c_str(), thdId);
         int check_alive_counter = 0;
-        const int check_alive_interval = 3000/ThreadIdle; // almost 3s
+        const int check_alive_interval = 3000/MonitorWait; // almost 3s
 
         for (;;) {
             if (isShutDown()) break;
@@ -1651,13 +1670,10 @@ private:
                         if (do_check_alive) {
                             checkAlive(asynclt);
                         }
-                        if (!asynclt->isQueueEmpty()) {
-                            asynclt->enableWrite(_efd, true);
-                        }
                     }
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(ThreadIdle));
+            std::this_thread::sleep_for(std::chrono::milliseconds(MonitorWait));
         }
         
         LOG_MSG(LogLevel::Debug, "%s monitor thread(%d) exit", desc().c_str(), thdId);
@@ -1700,7 +1716,7 @@ private:
             if (idle) {
                 // this thread is idle
                 std::unique_lock<std::mutex> lock(_lockWorker);
-                _cvWorker.wait_for(lock, std::chrono::milliseconds(ThreadIdle));
+                _cvWorker.wait_for(lock, std::chrono::milliseconds(WorkerWait));
             } else {
                 std::this_thread::yield();
             }
@@ -1751,7 +1767,7 @@ private:
     std::mutex _lockWorker;
     std::condition_variable _cvWorker;
     
-    enum { BufferSize = 4096, ThdIdBase = 300, ThreadIdle = 20, EpollWait = 50};
+    enum { BufferSize = 4096, ThdIdBase = 300, WorkerWait = 20, MonitorWait = 50, IOWait = 50 };
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
