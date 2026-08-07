@@ -1256,10 +1256,12 @@ private:
 // client side async mode
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+class tcpsock_ha_asynclt;
+
 class tcpsock_asynclt : public tcpsock_client {
 public:
-    tcpsock_asynclt(const char* addr, unsigned short port, tcp_message_protocol* protocol, unsigned long long seq = 0ULL, const char* owner = "") 
-        : tcpsock_client(addr, port, protocol, seq, owner) {
+    tcpsock_asynclt(tcpsock_ha_asynclt* ha, const char* addr, unsigned short port, tcp_message_protocol* protocol, unsigned long long seq = 0ULL, const char* owner = "") 
+        : tcpsock_client(addr, port, protocol, seq, owner), _ha(ha) {
         _recvCache = new memchunk(BufferSize);
     }
 
@@ -1348,6 +1350,8 @@ private:
     std::atomic<int> _efd{INVALID_SOCK};
     
     enum { BufferSize = 1024, MaxPendingSize = 10485760, MaxPendingMsg = 256 };
+public:
+    tcpsock_ha_asynclt* _ha{nullptr};
 };
 
 enum { POST_SUCCESS = 0, POST_FAIL = 1 };
@@ -1365,7 +1369,7 @@ public:
 
     // add one client: addr:port
     void addConnect(const char* addr, unsigned short port, tcp_message_protocol* protocol) {
-        tcpsock_asynclt* asynclt = new tcpsock_asynclt(addr, port, protocol, _cltSeq.fetch_add(1, std::memory_order_relaxed), _name.c_str());
+        tcpsock_asynclt* asynclt = new tcpsock_asynclt(this, addr, port, protocol, _cltSeq.fetch_add(1, std::memory_order_relaxed), _name.c_str());
         asynclt->connect(100);
         std::lock_guard<std::mutex> lock(_lockClients);
         _clients.push_back(asynclt);
@@ -1421,6 +1425,13 @@ protected:
     int _cltCursor;
     std::mutex _lockClients;
     std::atomic<unsigned long long> _cltSeq{1ULL};
+public:
+    int _workerIdx{0};
+};
+
+struct AsyncMsgPtr {
+    std::unique_ptr<tcp_message> msg;
+    tcpsock_ha_asynclt* ha_clt;
 };
 
 class async_client_manager {
@@ -1442,6 +1453,20 @@ public:
             return;
         }
 
+        workerNum = std::max(workerNum, 1);
+        workerNum = std::min(workerNum, 16);
+        _workerNum = workerNum;
+        for (int i = 0; i < _workerNum; ++i) {
+            _recvQueues[i] = std::make_unique<SafeQueue<AsyncMsgPtr, MaxPendingMsg> >();
+        }
+        
+        {
+            std::lock_guard<std::mutex> lock(_lockHAClients);
+            for (int i = 0; i < _haClients.size(); ++i) {
+                _haClients[i]->_workerIdx = i % _workerNum;
+            }
+        }
+
         _iothread = std::thread([&]() {
 			ioprocessor(ThdIdBase+1);  // 1
 		});
@@ -1449,7 +1474,6 @@ public:
 			monitor(ThdIdBase+2); // 2
 		});
 
-        _workerNum = std::min(workerNum, 16); // 21 ~ 36
         for (int i = 0; i < _workerNum; ++i) {
             short thdId = ThdIdBase+21+i;
             int workerIndex = i;
@@ -1473,6 +1497,14 @@ public:
             delete thd;
         }
         _workers.clear();
+        // drain any remaining messages in worker queues
+        for (int i = 0; i < _workerNum; ++i) {
+            if (_recvQueues[i]) {
+                AsyncMsgPtr ptr;
+                while (_recvQueues[i]->raw_pop(ptr)) {}
+                _recvQueues[i].reset();
+            }
+        }
         clearClients();
         if (!socket_poll::sp_invalid(_efd)) {
 			socket_poll::sp_release(_efd);
@@ -1483,11 +1515,18 @@ public:
 
     void stop(bool join = false) {
         setShutDown(true);
+        for (int i = 0; i < _workerNum; ++i) {
+            if (_recvQueues[i])
+                _recvQueues[i]->stop();
+        }
         if (join) serveUtilStop();
     }
 
     void manageClient(tcpsock_ha_asynclt* ha_clt) {
         std::lock_guard<std::mutex> lock(_lockHAClients);
+        if (_workerNum > 0) {
+            ha_clt->_workerIdx = _haClients.size() % _workerNum;
+        }
         _haClients.push_back(ha_clt);
     }
 
@@ -1501,6 +1540,10 @@ public:
         }
         std::lock_guard<std::mutex> lock(_lockMonitorColl);
         LOG_MSG(LogLevel::Debug, "%s: current clients=%d/%d", desc().c_str(), _fd2client.size(), total);
+        for (int i = 0; i < _workerNum; ++i) {
+            if (_recvQueues[i])
+                LOG_MSG(LogLevel::Debug, "%s: queue[%d] depth=%d", desc().c_str(), i, _recvQueues[i]->size());
+        }
     }
 
     tcp_message_protocol* getProtocol() { return _protocol.get(); }
@@ -1590,7 +1633,6 @@ private:
                 LOG_LAST_ERR("sp_wait fail, efd=%d", _efd);
                 break;
             }
-            bool hasRecv = false;
             for (int i = 0; i < n; ++i) {
                 if (isShutDown()) break;
                 
@@ -1603,8 +1645,12 @@ private:
                         if (isMonitored(asynclt)) {
                             if (asynclt->onRecv(&chunk)) {
                                 onIOError(fd, asynclt, "cache data");
+                            } else {
+                                tcp_message* msg = nullptr;
+                                while ((msg = asynclt->getRecvMsg()) != nullptr) {
+                                    dispatchAsyncMsg(msg, asynclt);
+                                }
                             }
-                            hasRecv = true;
                         } else {
                             LOG_MSG(LogLevel::Warn, "unidentified read, no monitored client(%p), recvLen=%d, fd=%d", asynclt, recvLen, fd);
                         }
@@ -1624,12 +1670,25 @@ private:
                     onIOError(fd, asynclt, "error or eof");
                 }
             }
-            if (hasRecv) {
-                _cvWorker.notify_all();
-            }
         }
         LOG_MSG(LogLevel::Debug, "%s ioprocessor thread(%d) exit", desc().c_str(), thdId);
         return 0;
+    }
+
+    void dispatchAsyncMsg(tcp_message* msg, tcpsock_asynclt* asynclt) {
+        tcpsock_ha_asynclt* ha_clt = asynclt->_ha;
+        if (ha_clt) {
+            int idx = ha_clt->_workerIdx;
+            AsyncMsgPtr ptr;
+            ptr.msg.reset(msg);
+            ptr.ha_clt = ha_clt;
+            if (!_recvQueues[idx]->push(std::move(ptr))) {
+                LOG_ERR_MSG("dispatchAsyncMsg fail, queue %d full, msg=%s", idx, msg->desc().c_str());
+            }
+        } else {
+            LOG_ERR_MSG("dispatchAsyncMsg fail, asynclt=%p has no ha_clt parent", asynclt);
+            delete msg;
+        }
     }
 
     int monitor(short thdId) {
@@ -1681,58 +1740,23 @@ private:
     }
     
     // send & recive
-    int worker(short thdId, int workerIndex) {
+    int worker(short thdId, int queueIndex) {
         log_utils::registerThreadId(thdId);
-        LOG_MSG(LogLevel::Debug, "%s worker thread(%d) start, index=%d", desc().c_str(), thdId, workerIndex);
-        int workerNum = _workerNum;
+        LOG_MSG(LogLevel::Debug, "%s worker thread(%d) start, index=%d", desc().c_str(), thdId, queueIndex);
 
         for (;;) {
-            if (isShutDown()) break;
-
-            bool idle = true;
-            // pickup matched part
-            std::vector<tcpsock_ha_asynclt*> haCltsPart;
-            {
-                std::lock_guard<std::mutex> lock(_lockHAClients);
-                for (int i = 0; i < _haClients.size(); ++i) {
-                    if (i % workerNum == workerIndex) {
-                        haCltsPart.push_back(_haClients[i]);
-                    }
-                }
-            }
-
-            // handle all clients in groups
-            for (tcpsock_ha_asynclt* ha_clt : haCltsPart) {
-                if (isShutDown()) break;
-                
-                std::vector<tcpsock_asynclt*> clients = ha_clt->allClients();
-                for (tcpsock_asynclt* asynclt : clients) {
-                    if (!isMonitored(asynclt))
-                        continue;
-                    if (notifyRecv(asynclt, ha_clt))
-                        idle = false;
-                }
-            }
-            if (idle) {
-                // this thread is idle
-                std::unique_lock<std::mutex> lock(_lockWorker);
-                _cvWorker.wait_for(lock, std::chrono::milliseconds(WorkerWait));
-            } else {
-                std::this_thread::yield();
+            AsyncMsgPtr ptr;
+            int rc = _recvQueues[queueIndex]->pop_timeout(ptr, 100);
+            if (rc == zbf::SQ_POP_SUCCESS) {
+                auto* ha_clt = ptr.ha_clt;
+                auto* msg = ptr.msg.get();
+                ha_clt->onResponse(msg);
+            } else if (rc == zbf::SQ_EXIT) {
+                break;
             }
         }
         LOG_MSG(LogLevel::Debug, "%s worker thread(%d) exit", desc().c_str(), thdId);
         return 0;
-    }
-
-    bool notifyRecv(tcpsock_asynclt* asynclt, tcpsock_ha_asynclt* ha_clt) {
-        tcp_message* msg = asynclt->getRecvMsg();
-        if (msg != nullptr) {
-            ha_clt->onResponse(msg);
-            delete msg;
-            return true;
-        }
-        return false;
     }
 
     bool checkAlive(tcpsock_asynclt* asynclt) {
@@ -1764,10 +1788,8 @@ private:
     std::unordered_set<tcpsock_asynclt*> _monitorColl;    // ref, do not manage memory
     std::unordered_map<int, tcpsock_asynclt*> _fd2client; // ref
     std::mutex _lockMonitorColl;
-    std::mutex _lockWorker;
-    std::condition_variable _cvWorker;
-    
-    enum { BufferSize = 4096, ThdIdBase = 300, WorkerWait = 20, MonitorWait = 50, IOWait = 50 };
+    enum { MaxWorkers = 16, MaxPendingMsg = 512, BufferSize = 4096, ThdIdBase = 300, MonitorWait = 50, IOWait = 50 };
+    std::array<std::unique_ptr<SafeQueue<AsyncMsgPtr, MaxPendingMsg> >, MaxWorkers> _recvQueues;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
