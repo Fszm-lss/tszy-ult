@@ -61,6 +61,34 @@ if(MYSQLCLIENT_LIBRARY)
     set_target_properties(mysqlclient PROPERTIES IMPORTED_LOCATION "${MYSQLCLIENT_LIBRARY}")
 endif()
 
+# jemalloc dynamic allocator (Linux only; set -DUSE_JEMALLOC=OFF to disable)
+option(USE_JEMALLOC "Use jemalloc dynamic allocator" ON)
+if(USE_JEMALLOC AND NOT WIN32)
+    find_library(JEMALLOC_LIBRARY jemalloc REQUIRED)
+    find_path(JEMALLOC_INCLUDE_DIR jemalloc/jemalloc.h REQUIRED)
+    message(STATUS "USE_JEMALLOC: lib=${JEMALLOC_LIBRARY}, include=${JEMALLOC_INCLUDE_DIR}")
+
+    # Global link and include for all subsequent targets
+    link_libraries(${JEMALLOC_LIBRARY})
+    include_directories(${JEMALLOC_INCLUDE_DIR})
+    add_compile_definitions(USE_JEMALLOC)
+
+    # Linux: binaries find libjemalloc.so in their own directory ($ORIGIN)
+    set(CMAKE_BUILD_RPATH "$ORIGIN")
+    set(CMAKE_INSTALL_RPATH "$ORIGIN")
+
+    # Resolve symlink: libjemalloc.so -> libjemalloc.so.2
+    get_filename_component(JEMALLOC_RUNTIME_LIB "${JEMALLOC_LIBRARY}" REALPATH)
+    get_filename_component(JEMALLOC_RUNTIME_NAME "${JEMALLOC_RUNTIME_LIB}" NAME)
+
+    # Copy libjemalloc.so.N to build directory for development/testing
+    add_custom_target(copy_jemalloc_so ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${JEMALLOC_RUNTIME_LIB}" "${CMAKE_BINARY_DIR}/${JEMALLOC_RUNTIME_NAME}"
+        BYPRODUCTS "${CMAKE_BINARY_DIR}/${JEMALLOC_RUNTIME_NAME}"
+        COMMENT "Copying ${JEMALLOC_RUNTIME_NAME} to binary output directory"
+    )
+endif()
+
 # examples
 add_executable(tcpserver  ${PROJECT_SOURCE_DIR}/examples/tcpserver.cpp)
 target_include_directories(tcpserver  PRIVATE ${PROJECT_SOURCE_DIR})

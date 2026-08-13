@@ -1,13 +1,22 @@
 #ifndef mem_alloc_hpp
 #define mem_alloc_hpp
+// 2025-9
+// set MALLOC_CONF env
+// export MALLOC_CONF="background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:30000,metadata_thp:auto"
+// export MALLOC_CONF="background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:30000,narenas:16,metadata_thp:auto,tcache:true,percpu_arena:percpu"
+// MALLOC_CONF="stats_print:true" ./your_app
 
 #include <cerrno>
-#include <cstdlib>
+#include <stdlib.h>
 #include <mutex>
 #include <typeinfo>
 #include <unordered_map>
 
 #include "log_utils.hpp"
+
+#ifdef USE_JEMALLOC
+#include <jemalloc/jemalloc.h>
+#endif
 
 #define ZBF_TRACE_MEMORY
 
@@ -59,7 +68,7 @@ inline void logMemTrackStat(bool logDetail = true) {
 }
 
 inline void* malloc(size_t size, const char* tag) {
-    void* mem = std::malloc(size);
+    void* mem = ::malloc(size);
     if (mem) {
         LOG_CHK_MSG("[%p:%d] malloc() at %s", mem, size, tag);
         _TRACK_MEM(mem, size, tag);
@@ -71,7 +80,7 @@ inline void* malloc(size_t size, const char* tag) {
 }
 
 inline void* realloc(void* mem, size_t size, const char* tag) {
-    void* new_mem = std::realloc(mem, size);
+    void* new_mem = ::realloc(mem, size);
     if (new_mem) {
         LOG_CHK_MSG("[%p:%d] realloc(%p) at %s", new_mem, size, mem, tag);
         _RETRACK_MEM(mem, new_mem, size, tag);
@@ -83,7 +92,7 @@ inline void* realloc(void* mem, size_t size, const char* tag) {
 }
 
 inline void* calloc(size_t n, size_t size, const char* tag) {
-    void* mem = std::calloc(n, size);
+    void* mem = ::calloc(n, size);
     if (mem) {
         LOG_CHK_MSG("[%p:%dx%d] calloc() at %s", mem, n, size, tag);
         _TRACK_MEM(mem, n*size, tag);
@@ -98,7 +107,7 @@ inline void free(void* mem, const char* tag) {
     if (mem == nullptr) return;
     LOG_CHK_MSG("[%p] free() at %s", mem, tag);
     _UNTRACK_MEM(mem);
-    std::free(mem);
+    ::free(mem);
 }
 
 template <typename T>
@@ -128,7 +137,7 @@ public:
 inline void logMemTrackStat(bool logDetail = true) {}
 
 inline void* malloc(size_t size) {
-    void* mem = std::malloc(size);
+    void* mem = ::malloc(size);
     if (mem) {
         return mem;
     }
@@ -138,7 +147,7 @@ inline void* malloc(size_t size) {
 }
 
 inline void* realloc(void* mem, size_t size) {
-    void* new_mem = std::realloc(mem, size);
+    void* new_mem = ::realloc(mem, size);
     if (new_mem) {
         return new_mem;
     }
@@ -148,7 +157,7 @@ inline void* realloc(void* mem, size_t size) {
 }
 
 inline void* calloc(size_t n, size_t size) {
-    void* mem = std::calloc(n, size);
+    void* mem = ::calloc(n, size);
     if (mem) {
         return mem;
     }
@@ -159,7 +168,7 @@ inline void* calloc(size_t n, size_t size) {
 
 inline void free(void* mem) {
     if (mem == nullptr) return;
-    std::free(mem);
+    ::free(mem);
 }
 
 template <typename T>
@@ -168,7 +177,23 @@ class object_tracker {
 
 #endif // ZBF_TRACE_MEMORY
 
+#ifdef USE_JEMALLOC
+inline void logJemallocStat() {
+    malloc_stats_print(nullptr, nullptr, "g");
+}
+
+inline bool isJemallocActive() {
+    bool active = false;
+    size_t sz = sizeof(active);
+    mallctl("config.debug", &active, &sz, nullptr, 0);
+    return true;
+}
+#else
+inline void logJemallocStat() {}
+inline bool isJemallocActive() { return false; }
+#endif
 
 } // namespace zbf
 
 #endif // mem_alloc_hpp
+

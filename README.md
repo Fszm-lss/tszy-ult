@@ -17,12 +17,12 @@ A C++17 header-only networking framework for building game server clusters. Cros
 - CMake 3.15+
 - OpenSSL, libcurl
 - MySQL client library (`libmysqlclient-dev` or `libmariadb-dev`) for MySQL proxy
-- Linux: [vcpkg](https://vcpkg.io/) with cpp-httplib, nlohmann-json, mongoc, hiredis
+- Linux: [vcpkg](https://vcpkg.io/) with cpp-httplib, nlohmann-json, mongoc, hiredis, jemalloc
 - Windows: MSYS2/UCRT64 with vendor dependencies
 
 Install vcpkg dependencies (Linux):
 ```bash
-vcpkg install cpp-httplib nlohmann-json openssl curl mongoc hiredis asio
+vcpkg install cpp-httplib nlohmann-json openssl curl mongoc hiredis asio jemalloc
 ```
 
 ### Build
@@ -37,6 +37,8 @@ cmake --build --preset debug
 # Build a single target
 cmake --build --preset debug --target lygate
 ```
+
+On Linux, the build links against **jemalloc** (`USE_JEMALLOC` is ON by default). Disable it with `-DUSE_JEMALLOC=OFF` when configuring. When enabled, `libjemalloc.so.N` is copied automatically to the binary output directory, and binaries use an `$ORIGIN` RPATH to find it at runtime.
 
 Post-build: `lycentral` and `testsslv2` auto-copy their required files (`examples/lycentral-conf.json` and `test/key/`) to the build directory. Other targets (e.g., `lygate`, `testhandshake`) require manual key/config placement.
 
@@ -199,6 +201,16 @@ server.close();         // Graceful shutdown
 
 Controlled by the `ZBF_TRACE_MEMORY` define (enabled by default). All allocations use `ZBF_MALLOC`/`ZBF_FREE` macros for per-file accounting. Key classes inherit from `object_tracker<T>` (CRTP) to count live instances. Call `logMemTrackStat()` to dump current allocation statistics — this is automatically called via `std::atexit` in most examples.
 
+On Linux, allocations are served by **jemalloc** (when `USE_JEMALLOC` is enabled) instead of the libc allocator. `zbf::logJemallocStat()` dumps jemalloc allocation statistics, and jemalloc can be tuned at runtime via the `MALLOC_CONF` environment variable, e.g.:
+
+```bash
+export MALLOC_CONF="background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:30000,metadata_thp:auto"
+```
+
+## Documentation
+
+- [lygc 微服务架构说明](doc/lygc微服务架构说明.md) (中文) — 详细介绍 lygc 框架的类继承关系、线程模型、消息协议、握手/加密流程与 DB 代理设计。
+
 ## Cluster Startup
 
 To run the full server cluster (in order):
@@ -238,6 +250,7 @@ cp -r test/key build/debug/
 | cpp-httplib | HTTP server for central registry |
 | nlohmann-json | JSON config parsing |
 | asio | Standalone ASIO TCP transport |
+| jemalloc | Dynamic memory allocator (Linux; optional via `USE_JEMALLOC=OFF`)
 | libmysqlclient / libmariadb | MySQL C client |
 | libmongoc | MongoDB C driver |
 | hiredis | Redis C client |
