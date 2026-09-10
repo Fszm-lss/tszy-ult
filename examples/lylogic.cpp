@@ -14,7 +14,7 @@ static lygc::NetServer* g_localServer = nullptr;
 
 class lycommon_handler : public lygc::UserHandler {
 public:
-    request_id_t onRequest(const lygc::lymsg_header* reqHeader, const std::string& reqData, std::string& respData) {
+    request_id_t onRequest(lygc::NetUser* user, const lygc::lymsg_header* reqHeader, const std::string& reqData, std::string& respData) {
         json jobj = json::parse(reqData);
         jobj["resp"] = "success";
         respData = jobj.dump();
@@ -26,7 +26,7 @@ public:
 
 class lygate_handler : public lygc::UserHandler {
 public:
-    request_id_t onRequest(const lygc::lymsg_header* reqHeader, const std::string& reqData, std::string& respData) {
+    request_id_t onRequest(lygc::NetUser* user, const lygc::lymsg_header* reqHeader, const std::string& reqData, std::string& respData) {
         json jobj = json::parse(reqData);
         jobj["resp"] = "success";
         respData = jobj.dump();

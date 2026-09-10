@@ -15,7 +15,7 @@
 // ---- byte order conversion switch ----
 // Define LYMSG_NETWORK_BYTE_ORDER to convert header fields between host and network byte order.
 // When undefined (default), fields use host byte order, suitable for homogeneous x86_64 deployments.
-// #define LYMSG_NETWORK_BYTE_ORDER
+#define LYMSG_NETWORK_BYTE_ORDER
 
 namespace lygc {
 using zbf::tcp_message_protocol;

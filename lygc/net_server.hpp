@@ -25,12 +25,13 @@ using zbf::tcpsock_server;
 using zbf::tcpsock_ha_asynclt;
 using zbf::async_client_manager;
 
-enum RespType { SYNC_RESPONSE = 0, NO_RESPONSE, ASYNC_RESPONSE = 101 };
+enum RespType { SYNC_RESPONSE = 0, NO_RESPONSE, ASYNC_RESPONSE };
 typedef uint64_t request_id_t;
 
+class NetUser;
 class UserHandler {
 public:
-    virtual request_id_t onRequest(const lymsg_header* reqHeader, const std::string& reqData, std::string& syncRespData) = 0;
+    virtual request_id_t onRequest(NetUser* user, const lymsg_header* reqHeader, const std::string& reqData, std::string& syncRespData) = 0;
 };
 
 class Responser {
@@ -102,11 +103,16 @@ public:
         if (!reqHeader) return -1;
         reqHeader->origin = _localOrigin;
         auto msg = std::unique_ptr<zbf::tcp_message>(lymsg_helper::packMsg(reqHeader, reqData));
+
+        if (handler) {
+            std::lock_guard<std::mutex> lock(_lockHandlers);
+            _msgHandlers.insert(std::make_pair(reqHeader->serial, handler));
+        }
         int rc = tcpsock_ha_asynclt::post(std::move(msg));
-        if (zbf::POST_SUCCESS == rc) {
+        if (zbf::POST_SUCCESS != rc) {
             if (handler) {
                 std::lock_guard<std::mutex> lock(_lockHandlers);
-                _msgHandlers.insert(std::make_pair(reqHeader->serial, handler));
+                _msgHandlers.erase(reqHeader->serial);
             }
         }
         return rc;
@@ -165,7 +171,7 @@ public:
     }
 
     NetServer(const ServerConfig& conf, LogLevel logLevel = LogLevel::Info) : tcpsock_server(new lymsg_protocol),
-    _config(conf), _reqIdCreator(RespType::ASYNC_RESPONSE), _asynCltMgr(new lymsg_protocol), _timerHelper(zbf::TickUnit::TenSecond) {
+    _config(conf), _reqIdCreator(MinRequestId), _asynCltMgr(new lymsg_protocol), _timerHelper(zbf::TickUnit::TenSecond) {
         std::string log_path = zbf::log_utils::createLogPath();
         log_utils::open(log_path.c_str(), logLevel);
         LOG_MSG(LogLevel::Info, "NetServer create(%s)", desc().c_str());
@@ -256,13 +262,10 @@ public:
         return handler;
     }
 
-    void saveReqContext(request_id_t reqId, NetUser* user, const lymsg_header* reqHeader, const std::string& reqData) {
-        auto userShared = user->shared_from_this();
-        auto ctx = std::make_unique<ReqContext>(userShared, reqHeader, reqData);
-        LOG_MSG(LogLevel::Trace, "%s, id=%lu, req=%s", __FUNCTION__, reqId, LYMSG_DESC(&ctx->reqHeader).c_str());
-        auto& shard = _reqShards[shardIdx(reqId)];
-        std::lock_guard<std::mutex> lock(shard.lock);
-        shard.map.insert(std::make_pair(reqId, std::move(ctx)));
+    request_id_t savePenddingReq(NetUser* user, const lymsg_header* reqHeader, const std::string& reqData) {
+        request_id_t reqId = genRequestId();
+        saveReqContext(reqId, user, reqHeader, reqData);
+        return reqId;
     }
 
     int response(request_id_t reqId, const std::string& respData) {
@@ -311,12 +314,6 @@ public:
         }
     }
 
-public:
-    request_id_t genRequestId() {
-        request_id_t reqId = _reqIdCreator.fetch_add(1, std::memory_order_relaxed);
-        return reqId;
-    }
-
     uint16_t origin() {
         return _config.origin;
     }
@@ -324,6 +321,23 @@ public:
     std::string desc() {
         return _config.toJsonStr();
     }
+
+protected:
+    void saveReqContext(request_id_t reqId, NetUser* user, const lymsg_header* reqHeader, const std::string& reqData) {
+        auto userShared = user->shared_from_this();
+        auto ctx = std::make_unique<ReqContext>(userShared, reqHeader, reqData);
+        LOG_MSG(LogLevel::Trace, "%s, id=%lu, req=%s", __FUNCTION__, reqId, LYMSG_DESC(&ctx->reqHeader).c_str());
+        auto& shard = _reqShards[shardIdx(reqId)];
+        std::lock_guard<std::mutex> lock(shard.lock);
+        shard.map.insert(std::make_pair(reqId, std::move(ctx)));
+    }
+
+    request_id_t genRequestId() {
+        request_id_t reqId = _reqIdCreator.fetch_add(1, std::memory_order_relaxed);
+        return reqId;
+    }
+
+    enum { MinRequestId = 101, };
 
 protected:
     ServerConfig _config;
@@ -356,14 +370,14 @@ void NetUser::onRequest(const lymsg_header* reqHeader, const std::string& reqDat
     }
     if (_handler) {
         std::string respData;
-        request_id_t reqId = _handler->onRequest(reqHeader, reqData, respData);
+        request_id_t reqId = _handler->onRequest(this, reqHeader, reqData, respData);
         if (reqId == RespType::SYNC_RESPONSE) {
             postMsg(std::unique_ptr<tcp_message>(createResponse(reqHeader, respData)));
         } else if (reqId == RespType::NO_RESPONSE) {
             postMsg(std::unique_ptr<tcp_message>(createResponse(reqHeader, std::string())));
         } else {
-            // save request context
-            _baseServer->saveReqContext(reqId, this, reqHeader, reqData);
+            // ASYNC_RESPONSE
+            // handler should call savePendingReq() first in onRequest(), and then call response() after handling
         }
     } else {
         LOG_ERR_MSG("no matched handler: msg=%s", LYMSG_DESC(reqHeader).c_str());

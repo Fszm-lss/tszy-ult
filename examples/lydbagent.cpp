@@ -15,12 +15,13 @@ static lygc::DBClientMySQL*   g_mysqlClient = nullptr;
 
 class AgentUserhandler : public lygc::UserHandler {
 public:
-    request_id_t onRequest(const lygc::lymsg_header* reqHeader, const std::string& reqData, std::string& syncRespData) {
+    request_id_t onRequest(lygc::NetUser* user, const lygc::lymsg_header* reqHeader, const std::string& reqData, std::string& syncRespData) {
         LOG_MSG(LogLevel::Info, "onRequest: req=%s", lygc::strBrief(reqData).c_str());
         lygc::lymsg_header header;
         memcpy(&header, reqHeader, sizeof(header));
 
-        request_id_t asyncReqId = g_localServ->genRequestId();
+        request_id_t asyncReqId = g_localServ->savePenddingReq(user, reqHeader, reqData);
+        LOG_MSG(LogLevel::Info, "savePenddingReq: req=%s, asyncReqId=%lu", lygc::strBrief(reqData).c_str(), asyncReqId);
         header.serial = asyncReqId;
 
         std::string sql_query = "select * from testdb.student";
@@ -31,7 +32,7 @@ public:
             g_localServ->response(respHeader->serial, respData);
         });
 
-        return asyncReqId;
+        return lygc::RespType::ASYNC_RESPONSE;
     }
 
     void showResp(const wjp::mysql_client_resp* resp) {
