@@ -40,7 +40,7 @@ cmake --build --preset debug --target lygate
 
 On Linux, the build links against **jemalloc** (`USE_JEMALLOC` is ON by default). Disable it with `-DUSE_JEMALLOC=OFF` when configuring. When enabled, `libjemalloc.so.N` is copied automatically to the binary output directory, and binaries use an `$ORIGIN` RPATH to find it at runtime.
 
-Post-build: `lycentral` and `testsslv2` auto-copy their required files (`examples/lycentral-conf.json` and `test/key/`) to the build directory. Other targets (e.g., `lygate`, `testhandshake`) require manual key/config placement.
+Post-build: `lycentral` auto-copies `lycentral-conf.json`, and a shared `copy_key ALL` target auto-copies `test/key/` → `build/<preset>/key` for `lygate`, `lygateclt`, `testsslv2`, `testhandshake`, `asio_tcpserver`, `asio_tcpclient`. Binaries read `key/...` relative to the run dir, so run them from the build directory.
 
 Available build targets: `tcpserver`, `tcpcltpool`, `lycentral`, `lylogic`, `lycommon`, `lycomasynclt`, `lygate`, `lygateclt`, `lydbproxy-mysql`, `lydbproxy-mongo`, `lydbproxy-redis`, `lydbagent`, `lydbagentclt`, `testsslv2`, `testhandshake`, `asio_tcpserver`, `asio_tcpclient`.
 
@@ -74,11 +74,7 @@ cd test && ./createkey.sh rsa   # RSA 4096-bit key pair
 ./createkey.sh clean            # Remove generated keys
 ```
 
-Keys are output to `test/key/`. These keys are also needed by `lygate` and `lygateclt` for the gateway handshake (see Cluster Startup). Only `testsslv2` has a CMake post-build step to copy keys — if building only `testhandshake`, copy manually:
-```bash
-cp -r test/key build/debug/
-```
-`testhandshake` tests both DH+RSA and ECDH+RSA handshake variants.
+Keys are output to `test/key/` (gitignored — always regenerate; never commit keys). They are copied automatically to `build/<preset>/key` by the shared `copy_key` target for `lygate`, `lygateclt`, `testsslv2`, `testhandshake`, and the ASIO demos — no manual `cp` needed. The ASIO TLS demos (`tls` mode) additionally need DH certs (`key/server.crt`, `key/client.crt`, `key/ca.crt`) produced by `createkey.sh dh`. `testhandshake` tests both DH+RSA and ECDH+RSA handshake variants.
 
 ## Architecture
 
@@ -178,8 +174,8 @@ An aggregation pattern is demonstrated by `lydbagent`: a `NetServer` that uses `
 | **Redis Proxy** | `lydbproxy-redis` | Redis proxy — connection pool via hiredis |
 | **DB Agent** | `lydbagent` | DB agent — app server that proxies to MySQL proxy via `DBClientMySQL` |
 | **DB Agent Client** | `lydbagentclt` | Test client — sends test messages to dbagent |
-| **ASIO Server** | `asio_tcpserver` | Demo — ASIO-based TCP echo (argv: host port) |
-| **ASIO Client** | `asio_tcpclient` | Demo — ASIO-based TCP client with sync & async modes |
+| **ASIO Server** | `asio_tcpserver` | Demo — ASIO TCP echo (argv: `host port [tls]`) |
+| **ASIO Client** | `asio_tcpclient` | Demo — ASIO TCP client, sync/async connect (argv: `host port [async] [tls]`) |
 
 Demo servers (`tcpserver`, `tcpcltpool`) demonstrate raw `tcpsock_server` and `tcpsock_cltpool` usage without the game server framework.
 
@@ -236,10 +232,7 @@ To run the full server cluster (in order):
 ./lydbagentclt
 ```
 
-Steps 6-7 require RSA keys from `test/key/` for the gateway handshake. Copy them to the build directory first:
-```bash
-cp -r test/key build/debug/
-```
+Steps 6-7 require RSA keys from `test/key/` for the gateway handshake. These are copied automatically to `build/<preset>/key` by the `copy_key` build target — run the binaries from the build directory (they read `key/...` relative to the current directory).
 
 ## Dependencies
 

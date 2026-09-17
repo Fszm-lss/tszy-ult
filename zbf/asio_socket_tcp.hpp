@@ -8,6 +8,7 @@
 #include <mutex>
 #include <atomic>
 #include "asio.hpp"
+#include "asio/ssl.hpp"
 #include "log_utils.hpp"
 #include "tcp_message.hpp"
 #include "asio_worker.hpp"
@@ -17,6 +18,138 @@ namespace zbf {
 
 using asio::ip::tcp;
 
+// SSL verify mode, mirroring tmp/ssl ssl_info::VerifyMode
+enum SslVerifyMode {
+    SslVerifyNone   = 0,
+    SslVerifySingle = 1,
+    SslVerifyDual   = 2,
+};
+
+// Build an asio ssl context from cert/key/ca file paths.
+inline std::shared_ptr<asio::ssl::context> make_ssl_context(
+    const std::string& crt, const std::string& key, const std::string& ca, int verify_mode, bool server) {
+    auto ctx = std::make_shared<asio::ssl::context>(asio::ssl::context::tls);
+    ctx->set_options(asio::ssl::context::default_workarounds | asio::ssl::context::no_sslv2);
+    if (server) {
+        ctx->use_certificate_chain_file(crt);
+        ctx->use_private_key_file(key, asio::ssl::context::pem);
+        if (verify_mode == SslVerifyDual) {
+            ctx->set_verify_mode(asio::ssl::verify_peer | asio::ssl::verify_fail_if_no_peer_cert);
+            ctx->load_verify_file(ca);
+        }
+    } else {
+        if (verify_mode == SslVerifyNone) {
+            ctx->set_verify_mode(asio::ssl::verify_none);
+            return ctx;
+        }
+        ctx->set_verify_mode(asio::ssl::verify_peer);
+        ctx->load_verify_file(ca);
+        if (verify_mode == SslVerifyDual) {
+            ctx->use_certificate_chain_file(crt);
+            ctx->use_private_key_file(key, asio::ssl::context::pem);
+        }
+    }
+    return ctx;
+}
+
+// Type-erased stream: abstracts plain tcp::socket and ssl::stream<tcp::socket>
+// so tcpsock_user stays non-template.
+class tcp_stream {
+public:
+    using HandshakeHandler = std::function<void(std::error_code)>;
+    using IOHandler        = asio::any_completion_handler<void(std::error_code, std::size_t)>;
+
+    virtual ~tcp_stream() = default;
+    virtual tcp::socket& sock() = 0;
+    virtual void async_handshake(bool server, HandshakeHandler h) = 0;
+    virtual void handshake(bool server) = 0;   // sync, raw = no-op
+    virtual void async_read(asio::mutable_buffer b, IOHandler h) = 0;
+    virtual void async_write(asio::const_buffer b, IOHandler h) = 0;
+    virtual void shutdown() = 0;
+    virtual void cancel() = 0;
+};
+
+class raw_stream : public tcp_stream {
+public:
+    explicit raw_stream(asio_worker::work_strand strand) : _strand(strand), _sock(strand.get_inner_executor()) {}
+
+    tcp::socket& sock() override { return _sock; }
+
+    void async_handshake(bool /*server*/, HandshakeHandler h) override {
+        h(std::error_code{});
+    }
+
+    void handshake(bool /*server*/) override {}
+
+    void async_read(asio::mutable_buffer b, IOHandler h) override {
+        asio::async_read(_sock, b, asio::bind_executor(_strand, std::move(h)));
+    }
+
+    void async_write(asio::const_buffer b, IOHandler h) override {
+        asio::async_write(_sock, b, asio::bind_executor(_strand, std::move(h)));
+    }
+
+    void shutdown() override {
+        _sock.shutdown(tcp::socket::shutdown_both);
+        _sock.close();
+    }
+
+    void cancel() override {
+        _sock.cancel();
+    }
+
+private:
+    asio_worker::work_strand _strand;
+    tcp::socket              _sock;
+};
+
+class ssl_stream : public tcp_stream {
+public:
+    ssl_stream(asio_worker::work_strand strand, std::shared_ptr<asio::ssl::context> ctx)
+        : _strand(strand), _ssl_ctx(std::move(ctx)), _stream(strand.get_inner_executor(), *_ssl_ctx) {}
+
+    tcp::socket& sock() override { return _stream.next_layer(); }
+
+    void async_handshake(bool server, HandshakeHandler h) override {
+        _stream.async_handshake(server ? asio::ssl::stream_base::server
+                                       : asio::ssl::stream_base::client,
+                                asio::bind_executor(_strand, std::move(h)));
+    }
+
+    void handshake(bool server) override {
+        _stream.handshake(server ? asio::ssl::stream_base::server
+                                 : asio::ssl::stream_base::client);
+    }
+
+    void async_read(asio::mutable_buffer b, IOHandler h) override {
+        asio::async_read(_stream, b, asio::bind_executor(_strand, std::move(h)));
+    }
+
+    void async_write(asio::const_buffer b, IOHandler h) override {
+        asio::async_write(_stream, b, asio::bind_executor(_strand, std::move(h)));
+    }
+
+    void shutdown() override {
+        sock().shutdown(tcp::socket::shutdown_both);
+        sock().close();
+    }
+
+    void cancel() override {
+        sock().cancel();
+    }
+
+private:
+    asio_worker::work_strand            _strand;
+    std::shared_ptr<asio::ssl::context> _ssl_ctx;
+    asio::ssl::stream<tcp::socket>      _stream;
+};
+
+inline std::unique_ptr<tcp_stream> make_tcp_stream(
+    asio_worker::work_strand& io_strand, const std::shared_ptr<asio::ssl::context>& ssl_ctx) {
+    if (ssl_ctx) return std::make_unique<ssl_stream>(io_strand, ssl_ctx);
+    return std::make_unique<raw_stream>(io_strand);
+}
+
 class tcpsock_user;
 class tcpsock_listener {
 public:
@@ -25,11 +158,11 @@ public:
     virtual void onDisconnect(std::shared_ptr<tcpsock_user> user) = 0;
 };
 
-
 class tcpsock_user : public std::enable_shared_from_this<tcpsock_user>, object_tracker<tcpsock_user> {
 public:
-    tcpsock_user(asio_worker::work_strand& io_strand, asio_worker::work_strand& wk_strand, bool server_side, tcp_message_protocol* protocol, tcpsock_listener* listener) :
-        _io_strand(io_strand), _worker_strand(wk_strand), _socket(io_strand.get_inner_executor()),
+    tcpsock_user(asio_worker::work_strand& io_strand, asio_worker::work_strand& wk_strand, bool server_side, 
+        tcp_message_protocol* protocol, tcpsock_listener* listener, std::shared_ptr<asio::ssl::context> ssl_ctx = nullptr) :
+        _io_strand(io_strand), _worker_strand(wk_strand), _stream(make_tcp_stream(io_strand, ssl_ctx)),
         _hbhelper(server_side? UserTimeout:HeartbeatTime), _stop(false), _server_side(server_side), _protocol(protocol), _listener(listener) {
         assert(_listener != nullptr);
     }
@@ -38,7 +171,17 @@ public:
     }
 
     tcp::socket& sock() {
-        return _socket;
+        return _stream->sock();
+    }
+
+    void async_handshake(bool server, tcp_stream::HandshakeHandler handler) {
+        asio::post(_io_strand, [self = shared_from_this(), server, handler = std::move(handler)]() mutable {
+            self->_stream->async_handshake(server, std::move(handler));
+        });
+    }
+
+    void handshake_sync(bool server) {
+        _stream->handshake(server);
     }
 
     void start() {
@@ -77,9 +220,9 @@ public:
         std::lock_guard<std::mutex> lock(_lockDesc);
         if (!_desc.empty()) return _desc;
         try {
-            if (_socket.is_open()) {
-                std::string addr = _socket.remote_endpoint().address().to_string();
-                int port = _socket.remote_endpoint().port();
+            if (_stream->sock().is_open()) {
+                std::string addr = _stream->sock().remote_endpoint().address().to_string();
+                int port = _stream->sock().remote_endpoint().port();
                 char szDesc[128] = { 0 };
                 snprintf(szDesc, sizeof(szDesc), "tcpsock_user:peer=%s|port:%d", addr.c_str(), port);
                 _desc = szDesc;
@@ -103,10 +246,10 @@ private:
         uint32_t hdrSz = _protocol->headerSize();
         auto header = std::make_shared<std::string>(hdrSz, '\0');
         asio::mutable_buffer buf = asio::buffer(header->data(), hdrSz);
-        asio::async_read(_socket, buf, asio::bind_executor(_io_strand,
+        _stream->async_read(buf,
             [self = shared_from_this(), header](const std::error_code ec, std::size_t bytes_trans) mutable {
                 self->read_body(header, ec, bytes_trans);
-            }));
+            });
     }
 
     void read_body(std::shared_ptr<std::string> header, const std::error_code ec, std::size_t bytes_trans) {
@@ -144,10 +287,10 @@ private:
 
         if (bodySz > 0) {
             asio::mutable_buffer buf = asio::buffer(msg->data.data() + hdrSz, bodySz);
-            asio::async_read(_socket, buf, asio::bind_executor(_io_strand,
+            _stream->async_read(buf,
                 [self = shared_from_this(), msg = std::move(msg)](const std::error_code ec, std::size_t bytes_trans) mutable {
                     self->handle_read(std::move(msg), ec, bytes_trans);
-                }));
+                });
         } else {
             handle_read(std::move(msg), ec, 0);
         }
@@ -230,8 +373,7 @@ private:
             return false;
         }
         try {
-            _socket.shutdown(tcp::socket::shutdown_both);
-            _socket.close();
+            _stream->shutdown();
         } catch (const asio::system_error& e) {
             LOG_ERR_MSG("(%s) try_stop error: %s, source=%d", desc().c_str(), e.what(), source);
         }
@@ -255,10 +397,10 @@ private:
         if (_writeQueue.empty() || _stop.load()) return;
         auto& msg = _writeQueue.front();
         asio::mutable_buffer buf = asio::buffer(msg->data.data(), msg->data.size());
-        asio::async_write(_socket, buf, asio::bind_executor(_io_strand,
+        _stream->async_write(buf,
             [self = shared_from_this()](const std::error_code ec, std::size_t bytes_trans) mutable {
                 self->handle_write(ec, bytes_trans);
-            }));
+            });
     }
 
     void handle_write(const std::error_code ec, std::size_t bytes_trans) {
@@ -295,19 +437,19 @@ private:
     }
 
 protected:
-    asio_worker::work_strand  _io_strand;
-    asio_worker::work_strand  _worker_strand;
-    tcp::socket               _socket;
-    heartbeat_helper          _hbhelper;
+    asio_worker::work_strand    _io_strand;
+    asio_worker::work_strand    _worker_strand;
+    std::unique_ptr<tcp_stream> _stream;
+    heartbeat_helper            _hbhelper;
+    bool                        _pending{false};
+    std::atomic<bool>           _stop;
+    bool                        _server_side;
+    tcp_message_protocol*       _protocol;
+    tcpsock_listener*           _listener;
+    std::string                 _desc;
+    std::mutex                  _lockDesc;
     std::deque<std::unique_ptr<tcp_message>> _writeQueue;
     std::deque<std::unique_ptr<tcp_message>> _readQueue;
-    bool                      _pending{false};
-    std::atomic<bool>         _stop;
-    bool                      _server_side;
-    tcp_message_protocol*     _protocol;
-    tcpsock_listener*         _listener;
-    std::string               _desc;
-    std::mutex                _lockDesc;
 
 #ifdef NDEBUG
     enum { UserTimeout = 90, HeartbeatTime = 30 }; // for release
@@ -320,9 +462,10 @@ protected:
 using user_queue = std::unordered_set<std::shared_ptr<tcpsock_user>>;
 class tcpsock_server : public std::enable_shared_from_this<tcpsock_server> {
 public:
-    tcpsock_server(const std::string& address, unsigned short port, tcp_message_protocol* protocol, std::unique_ptr<tcpsock_listener> listener)
+    tcpsock_server(const std::string& address, unsigned short port, tcp_message_protocol* protocol, 
+        std::unique_ptr<tcpsock_listener> listener, std::shared_ptr<asio::ssl::context> ssl_ctx = nullptr)
         : _ioProcessor("IO"), _acceptor(_ioProcessor.get(0)), _timer(_ioProcessor.get(0)),
-          _address(address), _port(port), _listener(std::move(listener)), _adapter(this), _protocol(protocol) {
+          _address(address), _port(port), _listener(std::move(listener)), _adapter(this), _protocol(protocol), _sslCtx(std::move(ssl_ctx)) {
         assert(_listener != nullptr);
     }
 
@@ -423,7 +566,7 @@ private:
 	}
 
     void do_accept() {
-        auto user = std::make_shared<tcpsock_user>(_ioProcessor.get_strand(0), _worker->get_strand(), true, _protocol.get(), &_adapter);
+        auto user = std::make_shared<tcpsock_user>(_ioProcessor.get_strand(0), _worker->get_strand(), true, _protocol.get(), &_adapter, _sslCtx);
         _acceptor.async_accept(user->sock(), [user, self = shared_from_this()](const std::error_code ec) {
             self->handle_accept(user, ec);
         });
@@ -443,18 +586,25 @@ private:
 
         // success
         LOG_MSG(LogLevel::Debug, "%s handle_accept success, user=(%s)", desc().c_str(), user->desc().c_str());
-        int curConn = currentConnections();
-        int maxConn = getMaxConnections();
-        if (curConn >= maxConn) {
-            LOG_MSG(LogLevel::Warn, "%s connection limit reached: %d/%d, reject new connection", desc().c_str(), curConn, maxConn);
-            user->stop();
-        } else {
-            {
-                std::lock_guard<std::mutex> lock(_lockUQ);
-                _userQueue.insert(user);
+        user->async_handshake(true, [user, self = shared_from_this()](const std::error_code ec) {
+            if (ec) {
+                LOG_ERR_MSG("%s handshake error: %s", self->desc().c_str(), ec.message().c_str());
+                user->stop();
+                return;
             }
-            user->start();
-        }
+            int curConn = self->currentConnections();
+            int maxConn = self->getMaxConnections();
+            if (curConn >= maxConn) {
+                LOG_MSG(LogLevel::Warn, "%s connection limit reached: %d/%d, reject new connection", self->desc().c_str(), curConn, maxConn);
+                user->stop();
+            } else {
+                {
+                    std::lock_guard<std::mutex> lock(self->_lockUQ);
+                    self->_userQueue.insert(user);
+                }
+                user->start();
+            }
+        });
         do_accept();
     }
 
@@ -511,26 +661,28 @@ private:
     };
 
     enum { ScanInterval = 5, LogEveryNScan = 12, DefaultMaxConns = 6000 };
-    asio_worker                         _ioProcessor;
-    tcp::acceptor                       _acceptor;
-    asio::steady_timer                  _timer;
-    std::string                         _address;
-    unsigned short                      _port;
-    std::unique_ptr<asio_worker>        _worker;
-    user_queue                          _userQueue;
-    std::mutex                          _lockUQ;
-    std::unique_ptr<tcpsock_listener>   _listener;
-    listener_adapter                    _adapter;
-    int                                 _scanCount{0};
-    std::atomic<int>                    _maxConnections{DefaultMaxConns};
+    asio_worker                           _ioProcessor;
+    tcp::acceptor                         _acceptor;
+    asio::steady_timer                    _timer;
+    std::string                           _address;
+    unsigned short                        _port;
+    std::unique_ptr<asio_worker>          _worker;
+    user_queue                            _userQueue;
+    std::mutex                            _lockUQ;
+    std::unique_ptr<tcpsock_listener>     _listener;
+    listener_adapter                      _adapter;
+    int                                   _scanCount{0};
+    std::atomic<int>                      _maxConnections{DefaultMaxConns};
     std::unique_ptr<tcp_message_protocol> _protocol;
+    std::shared_ptr<asio::ssl::context>   _sslCtx;
 };
 
 class tcpsock_client {
 public:
-    tcpsock_client(const std::string& host, int port, tcp_message_protocol* protocol, std::unique_ptr<tcpsock_listener> listener)
+    tcpsock_client(const std::string& host, int port, tcp_message_protocol* protocol,
+        std::unique_ptr<tcpsock_listener> listener, std::shared_ptr<asio::ssl::context> ssl_ctx = nullptr)
         : _worker(host+"-"+std::to_string(port), 2), _listener(std::move(listener)), _host(host), _port(port), _protocol(protocol),
-          _hb_timer(_worker.get(0)) {
+          _hb_timer(_worker.get(0)), _sslCtx(std::move(ssl_ctx)) {
         assert(_listener != nullptr);
     }
 
@@ -555,10 +707,13 @@ public:
             _user.reset();
         }
 		try {
-            _user = std::make_shared<tcpsock_user>(_worker.get_strand(0), _worker.get_strand(1), false, _protocol.get(), _listener.get());
+            _user = std::make_shared<tcpsock_user>(_worker.get_strand(0), _worker.get_strand(1), false, _protocol.get(), _listener.get(), _sslCtx);
             tcp::resolver resolver(_worker.get(0));
 			tcp::resolver::results_type resolve_result = resolver.resolve(_host, std::to_string(_port));
 			asio::connect(_user->sock(), resolve_result);
+            if (_sslCtx) {
+                _user->handshake_sync(false);
+            }
 		} catch (asio::system_error& e) {
 			LOG_ERR_MSG("%s connect error(%s), target=(%s:%d)", desc().c_str(), e.what(), _host.c_str(), _port);
             _user.reset();
@@ -598,21 +753,39 @@ public:
                     handler(-1);
                     return;
                 }
-                _user = std::make_shared<tcpsock_user>(_worker.get_strand(0), _worker.get_strand(1), false, _protocol.get(), _listener.get());
+                _user = std::make_shared<tcpsock_user>(_worker.get_strand(0), _worker.get_strand(1), false, _protocol.get(), _listener.get(), _sslCtx);
                 asio::async_connect(_user->sock(), results,
                     [this, done, timer, handler = std::move(handler)](const std::error_code& ec, const tcp::endpoint&) mutable {
-                        timer->cancel();
                         if (*done) return;
-                        *done = true;
                         if (ec) {
+                            timer->cancel();
+                            *done = true;
                             LOG_ERR_MSG("%s async_connect error(%s)", desc().c_str(), ec.message().c_str());
                             _user.reset();
                             handler(-2);
                             return;
                         }
                         LOG_MSG(LogLevel::Debug, "%s async_connect success, target=(%s:%d)", desc().c_str(), _host.c_str(), _port);
-                        _user->start();
-                        handler(0);
+                        if (_sslCtx) {
+                            _user->async_handshake(false, [this, done, timer, handler](const std::error_code& ec) mutable {
+                                if (*done) return;
+                                timer->cancel();
+                                *done = true;
+                                if (ec) {
+                                    LOG_ERR_MSG("%s async_connect handshake error(%s)", desc().c_str(), ec.message().c_str());
+                                    _user.reset();
+                                    handler(-3);
+                                    return;
+                                }
+                                _user->start();
+                                handler(0);
+                            });
+                        } else {
+                            timer->cancel();
+                            *done = true;
+                            _user->start();
+                            handler(0);
+                        }
                     });
             });
     }
@@ -649,13 +822,14 @@ private:
         });
     }
 
-    asio_worker                       _worker;
-    std::unique_ptr<tcpsock_listener> _listener;
-    std::shared_ptr<tcpsock_user>     _user;
-    std::string                       _host;
-    int                               _port;
+    asio_worker                           _worker;
+    std::unique_ptr<tcpsock_listener>     _listener;
+    std::shared_ptr<tcpsock_user>         _user;
+    std::string                           _host;
+    int                                   _port;
     std::unique_ptr<tcp_message_protocol> _protocol;
-    asio::steady_timer                _hb_timer;
+    asio::steady_timer                    _hb_timer;
+    std::shared_ptr<asio::ssl::context>   _sslCtx;
 };
 
 }

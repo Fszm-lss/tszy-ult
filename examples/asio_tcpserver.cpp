@@ -41,8 +41,8 @@ void onExit() {
 
 int main(int argc, char** argv)
 {
-    if (argc != 3) {
-        printf("program <host addr> <port>\n");
+    if (argc < 3) {
+        printf("program <host addr> <port> [tls]\n");
         return 1;
     }
 
@@ -53,9 +53,19 @@ int main(int argc, char** argv)
     log_utils::log_level = LogLevel::TraceMore;
     LOG_MSG(LogLevel::Info, "main start");
 
+    bool tls = false;
+    for (int i = 3; i < argc; ++i) {
+        if (std::string(argv[i]) == "tls") tls = true;
+    }
+
     unsigned short port = atoi(argv[2]);
     auto listener = std::make_unique<MyListener>();
-    g_server = std::make_shared<tcpsock_server>(std::string(argv[1]), port, new default_msg_proto, std::move(listener));
+    std::shared_ptr<asio::ssl::context> ssl_ctx;
+    if (tls) {
+        ssl_ctx = make_ssl_context("key/server.crt", "key/server.key", "key/ca.crt", SslVerifySingle, true);
+        LOG_MSG(LogLevel::Info, "main start with tls");
+    }
+    g_server = std::make_shared<tcpsock_server>(std::string(argv[1]), port, new default_msg_proto, std::move(listener), ssl_ctx);
     g_server->start();
     g_server->serveUtilStop();
     g_server.reset();

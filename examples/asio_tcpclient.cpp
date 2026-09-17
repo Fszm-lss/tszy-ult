@@ -30,17 +30,27 @@ void onExit() {
 int main(int argc, char** argv)
 {
     if (argc < 3) {
-        printf("program <server addr> <server port> [async]\n");
+        printf("program <server addr> <server port> [async] [tls]\n");
         return 1;
     }
 
     std::atexit(onExit);
     log_utils::log_level = LogLevel::TraceMore;
     unsigned short port = atoi(argv[2]);
-    bool async = (argc >= 4 && std::string(argv[3]) == "async");
+    bool async = false, tls = false;
+    for (int i = 3; i < argc; ++i) {
+        std::string a(argv[i]);
+        if (a == "async") async = true;
+        else if (a == "tls") tls = true;
+    }
 
     default_msg_proto* proto = new default_msg_proto;
-    auto clt = std::make_unique<tcpsock_client>(argv[1], port, proto, std::make_unique<listener>());
+    std::shared_ptr<asio::ssl::context> ssl_ctx;
+    if (tls) {
+        ssl_ctx = make_ssl_context("key/client.crt", "key/client.key", "key/ca.crt", SslVerifySingle, false);
+        LOG_MSG(LogLevel::Info, "start with tls");
+    }
+    auto clt = std::make_unique<tcpsock_client>(argv[1], port, proto, std::make_unique<listener>(), ssl_ctx);
     clt->start();
 
     if (async) {

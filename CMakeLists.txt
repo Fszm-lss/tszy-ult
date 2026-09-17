@@ -99,10 +99,12 @@ target_link_libraries(tcpcltpool Threads::Threads)
 
 add_executable(asio_tcpserver ${PROJECT_SOURCE_DIR}/examples/asio_tcpserver.cpp)
 target_include_directories(asio_tcpserver PRIVATE ${PROJECT_SOURCE_DIR})
-target_link_libraries(asio_tcpserver Threads::Threads asio::asio)
+target_link_libraries(asio_tcpserver Threads::Threads asio::asio OpenSSL::SSL OpenSSL::Crypto)
+add_dependencies(asio_tcpserver copy_key)
 add_executable(asio_tcpclient ${PROJECT_SOURCE_DIR}/examples/asio_tcpclient.cpp)
 target_include_directories(asio_tcpclient PRIVATE ${PROJECT_SOURCE_DIR})
-target_link_libraries(asio_tcpclient Threads::Threads asio::asio)
+target_link_libraries(asio_tcpclient Threads::Threads asio::asio OpenSSL::SSL OpenSSL::Crypto)
+add_dependencies(asio_tcpclient copy_key)
 
 add_custom_target(copy_lycentral_conf ALL
     COMMAND ${CMAKE_COMMAND} -E copy ${PROJECT_SOURCE_DIR}/examples/lycentral-conf.json ${CMAKE_BINARY_DIR}/lycentral-conf.json
