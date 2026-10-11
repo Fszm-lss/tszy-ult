@@ -180,7 +180,7 @@ public:
         });
     }
 
-    void handshake_sync(bool server) {
+    void handshake(bool server) {
         _stream->handshake(server);
     }
 
@@ -712,7 +712,7 @@ public:
 			tcp::resolver::results_type resolve_result = resolver.resolve(_host, std::to_string(_port));
 			asio::connect(_user->sock(), resolve_result);
             if (_sslCtx) {
-                _user->handshake_sync(false);
+                _user->handshake(false);
             }
 		} catch (asio::system_error& e) {
 			LOG_ERR_MSG("%s connect error(%s), target=(%s:%d)", desc().c_str(), e.what(), _host.c_str(), _port);

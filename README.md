@@ -110,7 +110,9 @@ Client connects → `tcpsock_user::onRecvMsg` → `NetUser::onRecvMsg` unpacks v
 |-------------|----------|
 | `0` (`SYNC_RESPONSE`) | Response sent immediately to the caller |
 | `1` (`NO_RESPONSE`) | An empty ACK is sent |
-| Other (`>=2`, including `ASYNC_RESPONSE = 101`) | Request context saved; response delivered later via `NetServer::response(serial, data)` |
+| `>=2` (`ASYNC_RESPONSE` = 2) | Async: context is **not** auto-saved — handler calls `NetServer::savePenddingReq()` in `onRequest()` and later replies via `NetServer::response(reqId, data)` |
+
+`savePenddingReq()` returns a `request_id_t` (starting at 101) and saves the `ReqContext` in a sharded map. Handlers set `header.serial = reqId` when forwarding via `NetClient::request`, then call `response(respHeader->serial, ...)` in the callback. Contexts are cleaned up on caller disconnect (`cleanupUserContext`).
 
 For inter-service communication, `NetClient::request` dispatches a message and registers a callback by serial number. When the response arrives, `NetClient::onResponse` matches the serial and invokes the handler.
 

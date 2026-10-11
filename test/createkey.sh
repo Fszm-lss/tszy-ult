@@ -60,7 +60,9 @@ if [ $dh -eq 1 ] || [ $ecdh -eq 1 ]; then
     # Generate server certificate signing request (CN=fszm.com)
     openssl req -new -key server.key -subj "/CN=fszm.com" -out server.csr
     # Sign server certificate with CA (valid 3650 days / 10 years)
-    openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 3650 -out server.crt
+    echo 'subjectAltName=DNS:localhost,IP:127.0.0.1,DNS:fszm.com' > server.ext
+    openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 3650 -extfile server.ext -out server.crt
+    rm -f server.ext
 
     # --- Client ---
     if [ $dh -eq 1 ]; then
